@@ -1,0 +1,121 @@
+"""
+The config file that controls all the parameters for the file
+"""
+
+import numpy as np 
+import sys
+import time
+import os
+from pathlib import Path
+
+
+main_file = 'main'
+PROJECT_ROOT = Path(__file__).resolve().parent
+TEMP_ROOT = PROJECT_ROOT / ('%s_tmp' % main_file)
+
+FILE_PATHS = {
+	'MAIN_FILE' : main_file, # 
+	'SAT_SOLVER' : 'kissat', # SAT solver command
+	'ESPRESSO' : 'espresso', # espresso command
+	'ESPRESSO_DIFF_TEMP_FOLDER' : str(TEMP_ROOT / 'espresso_diff_tmp'), # do not touch this
+	'ESPRESSO_DIFF_SAVED_FOLDER' : str(TEMP_ROOT / 'espresso_diff'), # do not touch this
+    'ESPRESSO_LINEAR_TEMP_FOLDER' : str(TEMP_ROOT / 'espresso_linear_tmp'), # do not touch this
+	'ESPRESSO_LINEAR_SAVED_FOLDER' : str(TEMP_ROOT / 'espresso_linear'), # do not touch this
+    
+	'VERILOG_FOLDER' : str(TEMP_ROOT / 'verilog'), # do not touch this
+    'SAT_DIFF_FOLDER' : str(TEMP_ROOT / 'sat_diff_tmp'), # do not touch this
+    'SAT_LINEAR_FOLDER' : str(TEMP_ROOT / 'sat_linear_tmp') # do not touch this
+}
+
+FRAMEWORK = {
+	# plugins: use the stable B/C interfaces; legacy: use the original SAT/Yosys evaluators.
+	'EVALUATION_MODE': os.getenv('UKNIT_EVALUATION_MODE', 'plugins').strip().lower(),
+	'PLUGIN_PACKAGE': os.getenv('UKNIT_PLUGIN_PACKAGE', 'team_plugins').strip(),
+}
+
+HYPERPARAMETERS = { # GENERIC_SETTINGS
+	'POPULATION_SIZE' : 2, ######30, # 200 # poplutationSize
+	# 'MAX_GENERATION': [0,0,0,100,100,100,100,100,100,100,100,100,100], # starting from round 3
+	'MAX_GENERATION': [0,0,0,3,3,3,3,3,3,3,3,3,3], # for testing purposes
+	'MAX_NUM_ROUNDS' : 4, ######12, # number of rounds for the cipher
+	'NUM_OF_THREADS' : 4, #####30, # number of threads
+}
+
+GENETIC_ALGO = { # GENETIC_SETTINGS
+	'MUTATION_PROB' : 0.0, #####0.05, # probability of mutation 0.05
+	'BREEDING_POPULATION_PROPORTION' : 0.25, ##### 0.4, # 繁殖池占种群比例 the proportion of the population that will become the breeding population
+	'NUM_FIT_CIPHERS' : 1, #### 10, # 10 # the fit ciphers
+	'SBOX' : {  # Note: the entries should sum up to 1
+		'SWAP_ENTRIES' : 0.2, # S[i],S[j] = S[j],S[i]
+		'AFFINE': 0.2, # change to a randomly affine equivalence sbox
+		'LINEAR': 0.3, # change to a randomly linear equivalence sbox
+		'BITPERM' : 0.3, # change to a randomly bit equivalence sbox 
+	},
+	'LINEAR' : { # 
+		'MAX_ROW_SWAPS' : 1, # minimum of 1 # maximum number of row swaps 
+		'MAX_COL_SWAPS' : 1, # minimum of 1 # maximum number of column swaps
+	},
+	'CROSSOVER' : { # Note: the entries should sum up to 1
+		'SINGLE' : 0.6,
+		'DOUBLE' : 0.3,
+		'UNIFORM' : 0.1, 
+	},
+	'ADD_ONE_ROUND': {	# the program assumes these sum to 1 # uniform
+		'STEAL': 0.8, # stealing one round off from another member in the generation
+		'RANDOM': 0.2, # smartly generate a good one round function randomly
+	}
+}
+
+INIT_SETTINGS = {
+	'INIT_NUM_ROUNDS' : 3, # 3 # initNumRounds
+	'SBOX' : { # SBOX_SETTINGS
+		'MANTIS_ONLY' : True, # mantis 优先判断这个
+		'MAX_4_DIFF_UNIFORMITY' : False, # the set of sboxes with differential uniformity of maximum 4
+	},
+	'PERMUTATION' : {
+		'MIXCOLUMNS' : { # the program assumes these sum to 1 # uniform
+			'PRINCE_LIKE': 1, 
+			'MANTIS_LIKE': 0, 
+		},
+		'SHIFTROWS' : { # the program assumes these sum to 1 # uniform
+			'AES_LIKE' : 1,
+			'MIDORI_LIKE' : 0,
+		},
+		'MIXROWS' : False, # MIXROWS
+	},
+    'INCLUDE_PRINCE' : True, # include prince as one of the candidates?
+    'INCLUDE_UKNIT' : False, # include uknitbe as one of the candidates?
+}
+
+
+
+SECURITY = { # SECURITY_SETTINGS
+    'INIT_DIFF_SECURITY' : [0,0,0,15,33,48,59,72,80,90,98,109,114], # we start looking for differential characteristic at this probability for each length
+	'MAX_DIFF_SECURITY' : 125,  # maxSecurity
+	'INIT_LINEAR_SECURITY' : [0,0,0,8,17,25,30,36,40,45,49,55,57], # we start looking for linear trail at this bias for each length
+	'MAX_LINEAR_SECURITY' : 63,  # maxSecurity
+	'MAX_WINDOW' : 8, # maximum window length
+    'MAX_TIME': 10000, # max time to compute
+}
+
+GENETIC_FUNCTIONS = { # GENETIC_FUNCTIONS
+	'FITNESS_TO_DIVERSITY_RATIO' : [1,10], # [a,b] -> a * fitness ^ 2 + b * diversity ^ 2 #
+	'FITNESS_FORMULA' : [0,0,0,
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 2086.48 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 2782.61 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 3411.64 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 4140.50 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 4732.10 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 5522.25 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 6368.43 else 0),
+					  lambda sec,lat,rd: sec**2/lat + (-100 if lat > 6950.33 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 7646.79 else 0),
+                      lambda sec,lat,rd: sec**2/lat + (-100 if lat > 8349.53 else 0),
+					]
+}
+
+
+BRUTEFORCE = {
+	'EXPANDED_POPULATION_SIZE' : 20, # 2000 # for brute force
+	'LINEAR_ATTEMPTS_PER_CIPHER' : 1000, # 1000
+}
