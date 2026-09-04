@@ -15,6 +15,7 @@ import config
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor
 import json
+import warnings
 try:
     from yosys.main import Yosys
 except ImportError:  # pyosys is optional when the plugin evaluator is used
@@ -158,6 +159,7 @@ class Member:
             self.round_functions.insert(0,r)
             for i,rf in enumerate(self.round_functions):
                 rf.round_index = i
+                rf.substitution.round_index = i
             self.num_rounds += 1
         else:
             self.round_functions[-1].linear = r.linear
@@ -183,6 +185,7 @@ class Member:
             self.round_functions.insert(0,r)
             for i,rf in enumerate(self.round_functions):
                 rf.round_index = i
+                rf.substitution.round_index = i
             self.num_rounds += 1
         else: # add to the back
             self.round_functions[-1].linear = r.linear
@@ -193,13 +196,23 @@ class Member:
 
     def add_round_function(self,round_function):
         round_function.round_index = self.num_rounds
+        round_function.substitution.round_index = self.num_rounds
         self.round_functions.append(round_function)
         self.num_rounds += 1
 
     def mutate(self,prob):
-        for round_function in self.round_functions:
-            if np.random.uniform(0,1) >= prob: continue
-            round_function.mutate()
+        """Apply one child-level mutation event with probability ``prob``."""
+        if not self.round_functions or np.random.uniform(0, 1) >= float(prob):
+            return None
+        round_index = int(np.random.randint(0, len(self.round_functions)))
+        # Mutation is selected once per child.  The round function then
+        # chooses whether this event changes its S-box layer or its complete
+        # linear-layer component.
+        mutation = self.round_functions[round_index].mutate()
+        return {
+            'round_index': round_index,
+            'mutation': mutation,
+        }
     
     def compute_fitness(self, context=None):
         """Evaluate this member using the configured plugin or legacy path."""
@@ -594,20 +607,71 @@ class Member:
 
     def get_uknitbc(self,nr,window=0):
         project_root = Path(__file__).resolve().parents[1]
-        candidates = [
+        configured = str(
+            config.INIT_SETTINGS.get('UKNIT_BASELINE_PATH', '') or ''
+        ).strip()
+        candidates = []
+        if configured:
+            configured_path = Path(configured)
+            candidates.append(
+                configured_path
+                if configured_path.is_absolute()
+                else project_root / configured_path
+            )
+        candidates.extend([
             project_root / 'uknit64_cipher.pkl',
             project_root.parent / 'uknit64_cipher.pkl',
-        ]
-        file = next((path for path in candidates if path.exists()), candidates[0])
+        ])
+        # Keep the search order stable while removing duplicate paths.
+        candidates = list(dict.fromkeys(path.resolve() for path in candidates))
+        file = next((path for path in candidates if path.is_file()), None)
+        if file is None:
+            if config.INIT_SETTINGS.get('UKNIT_FALLBACK_RANDOM', True):
+                # A missing baseline must not make the framework unusable.  A
+                # random candidate has the same valid round shape, but it does
+                # not represent a particular published uKNIT window.
+                warnings.warn(
+                    'uknit64_cipher.pkl was not found; using a random candidate '
+                    'instead of the published uKNIT-BC baseline. The window '
+                    'index is retained only as metadata.',
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.randomize(nr)
+                self.uknit_source = 'random_fallback'
+                self.uknit_window = int(window)
+                return
+            searched = ', '.join(str(path) for path in candidates)
+            raise FileNotFoundError(
+                'INCLUDE_UKNIT=True requires the precomputed uKNIT-BC baseline '
+                'uknit64_cipher.pkl. Searched: %s. Put the file in the project '
+                'root, set UKNIT_BASELINE_PATH, or enable '
+                'UKNIT_FALLBACK_RANDOM.' % searched
+            )
+
         cipher = utils.pickle_load(file)
+        source_rounds = getattr(cipher, 'round_functions', None)
+        required_rounds = int(window) + int(nr)
+        try:
+            source_round_count = len(source_rounds)
+        except TypeError:
+            source_round_count = 0
+        if source_round_count < required_rounds:
+            raise ValueError(
+                'uKNIT baseline %s has %s rounds, but window=%s and nr=%s '
+                'require at least %s rounds.'
+                % (file, source_round_count, window, nr, required_rounds)
+            )
 
         self.round_functions = []
         self.num_rounds = 0
         for n in range(window,nr+window-1):
-            self.add_round_function(cipher.round_functions[n])
-        rf = cipher.round_functions[nr+window-1]
+            self.add_round_function(deepcopy(source_rounds[n]))
+        rf = deepcopy(source_rounds[nr+window-1])
         rf.linear = None
         self.add_round_function(rf)
+        self.uknit_source = str(file)
+        self.uknit_window = int(window)
 
     def get_prince(self,nr):
         # this only implements the front of prince
@@ -681,7 +745,10 @@ class Member:
             list(config.GENETIC_ALGO['CROSSOVER'].keys()),
             p=list(config.GENETIC_ALGO['CROSSOVER'].values()),
         ))
-        component_count = 2 * num_rounds
+        # The chromosome is [S0, L0, S1, L1, ..., S_(r-1)].  The final
+        # substitution layer has no following linear component, so the final
+        # ``None`` placeholder is not a crossover slot.
+        component_count = max(1, 2 * num_rounds - 1)
         source_map_a = []
         source_map_b = []
         details = {
@@ -691,9 +758,11 @@ class Member:
         }
 
         if choice == 'SINGLE':
-            # With one round there are only two component slots (S-box and a
-            # final ``None`` linear layer), so the only useful cut is at 1.
-            cut = int(np.random.randint(1, component_count))
+            # A one-round chromosome contains only S_(r-1), so use a
+            # degenerate cut record while preserving the valid child shape.
+            cut = 1 if component_count <= 1 else int(
+                np.random.randint(1, component_count)
+            )
             cuts = [cut]
             details['cuts'] = list(cuts)
             details['cut_points'] = list(cuts)
@@ -702,10 +771,10 @@ class Member:
                 source_map_a.append('parent_a' if first_half else 'parent_b')
                 source_map_b.append('parent_b' if first_half else 'parent_a')
         elif choice == 'DOUBLE':
-            if component_count <= 2:
-                # A two-cut crossover is undefined for a one-round cipher.
-                # Keep the requested strategy in the audit record but use its
-                # single-cut degenerate form so the child remains well formed.
+            if component_count <= 3:
+                # Fewer than four chromosome components cannot provide two
+                # distinct internal cuts.  Keep the requested strategy in the
+                # audit record but use a single-cut degenerate form.
                 cuts = [1]
                 details['fallback'] = 'single_cut_insufficient_components'
             else:
@@ -730,22 +799,21 @@ class Member:
                 source_map_b.append('parent_b' if segment % 2 == 0 else 'parent_a')
         elif choice == 'UNIFORM':
             # Uniform crossover is per S-box for substitution and per matrix
-            # for the linear layer.  The final round's linear source is still
-            # recorded even though both parents provide ``None``.
+            # for the linear layer.  The final round has no linear component.
             round_sources = []
             for round_index in range(num_rounds):
                 sbox_sources = []
                 for _ in range(16):
                     source = 'parent_a' if int(np.random.randint(0, 2)) == 0 else 'parent_b'
                     sbox_sources.append(source)
-                linear_source = (
+                linear_source = None if round_index == num_rounds - 1 else (
                     'parent_a' if int(np.random.randint(0, 2)) == 0 else 'parent_b'
                 )
                 opposite_sbox_sources = [
                     'parent_b' if source == 'parent_a' else 'parent_a'
                     for source in sbox_sources
                 ]
-                opposite_linear_source = (
+                opposite_linear_source = None if linear_source is None else (
                     'parent_b' if linear_source == 'parent_a' else 'parent_a'
                 )
                 round_sources.append({
@@ -776,24 +844,37 @@ class Member:
                     )
                     for sbox_index, source_name in enumerate(sbox_sources):
                         source_round = _source_member(source_name).round_functions[round_index]
+                        source_substitution_layer = source_round.substitution
                         source_substitution.add_sbox(
-                            deepcopy(source_round.substitution.sboxes[sbox_index])
+                            deepcopy(source_substitution_layer.sboxes[sbox_index]),
+                            input_permutation=deepcopy(
+                                getattr(source_substitution_layer, 'input_permutations', [None] * 16)[sbox_index]
+                            ),
+                            output_permutation=deepcopy(
+                                getattr(source_substitution_layer, 'output_permutations', [None] * 16)[sbox_index]
+                            ),
                         )
                     linear_source_name = (
                         round_source['linear_source']
                         if child_index == 0
                         else round_source['linear_source_child_b']
                     )
-                    linear_source = _source_member(linear_source_name).round_functions[round_index]
+                    if linear_source_name is None:
+                        linear = None
+                    else:
+                        linear_source = _source_member(linear_source_name).round_functions[round_index]
+                        linear = deepcopy(linear_source.linear)
                     substitution = source_substitution
-                    linear = deepcopy(linear_source.linear)
                 else:
                     source_name = (source_map_a if child_index == 0 else source_map_b)[2 * round_index]
                     source_round = _source_member(source_name).round_functions[round_index]
                     substitution = deepcopy(source_round.substitution)
-                    linear_name = (source_map_a if child_index == 0 else source_map_b)[2 * round_index + 1]
-                    linear_round = _source_member(linear_name).round_functions[round_index]
-                    linear = deepcopy(linear_round.linear)
+                    if round_index == num_rounds - 1:
+                        linear = None
+                    else:
+                        linear_name = (source_map_a if child_index == 0 else source_map_b)[2 * round_index + 1]
+                        linear_round = _source_member(linear_name).round_functions[round_index]
+                        linear = deepcopy(linear_round.linear)
 
                 child_round = components.round_function()
                 child_round.add_substitution_layer(substitution)
@@ -805,6 +886,7 @@ class Member:
             # object (older pickles and small test fixtures can do this).
             if child.round_functions:
                 child.round_functions[-1].linear = None
+            self._validate_crossover_linear_layers(child)
 
             child.crossover_strategy = choice
             child.crossover_details = deepcopy(details)
@@ -826,6 +908,25 @@ class Member:
             return child
 
         return _build_child(0), _build_child(1)
+
+    @staticmethod
+    def _validate_crossover_linear_layers(child):
+        """Validate complete linear components after crossover materialization."""
+        rounds = getattr(child, 'round_functions', [])
+        for round_index, round_function in enumerate(rounds):
+            linear = getattr(round_function, 'linear', None)
+            if round_index == len(rounds) - 1:
+                if linear is not None:
+                    raise ValueError('final round must not contain a linear layer')
+                continue
+            matrix = getattr(linear, 'matrix', None) if linear is not None else None
+            if matrix is None or not linear_functions.is_valid_linear_matrix(
+                matrix, row_column_weight=3
+            ):
+                raise ValueError(
+                    'crossover produced an invalid 64x64 binary linear matrix '
+                    f'at round {round_index}'
+                )
     
     def print_member(self):
         print('num_rounds: %s' % (self.num_rounds))
@@ -997,12 +1098,25 @@ class Generation:
             if memberA.is_equal(memberB): return True
         return False
 
-    def breeding(self, advisor=None, generation_context=None, engineering_validator=None):
-        """Create children by crossover, then apply one batched LLM mutation plan.
+    def _force_unique_mutation(self, member, forbidden, max_attempts=128):
+        """Mutate a duplicate child until its concrete cipher is unique."""
+        attempts = 0
+        last_mutation = None
+        while self.ismember(member, forbidden):
+            if attempts >= max_attempts:
+                raise RuntimeError('unable to produce a unique child after forced mutation')
+            last_mutation = member.mutate(prob=1.0)
+            if last_mutation is None:
+                raise RuntimeError('forced mutation did not produce a mutation event')
+            attempts += 1
+        return last_mutation, attempts
 
-        The legacy random mutation path is intentionally not called here.  When
-        the advisor is disabled or unavailable it returns deep-copied children
-        unchanged and a structured no-op report.
+    def breeding(self, advisor=None, generation_context=None, engineering_validator=None):
+        """Create crossover children, enforce uniqueness, then call the advisor.
+
+        Each child first receives the configured child-level random component
+        mutation (5% normally, forced to 100% for duplicates).  The optional
+        advisor then applies its separately validated mutation plan.
         """
         self.next_members = []
         self.last_breeding_records = []
@@ -1030,7 +1144,34 @@ class Generation:
                 child.candidate_id = 'r%02d-g%04d-child-%04d' % (
                     self.num_rounds, self.gen_index, child_index
                 )
-                duplicate = self.ismember(child, self.next_members)
+                existing = list(self.members) + list(self.fittest_population)
+                duplicate = self.ismember(child, existing + self.next_members)
+                mutation_probability = 1.0 if duplicate else float(
+                    config.GENETIC_ALGO['MUTATION_PROB']
+                )
+                mutation = child.mutate(prob=mutation_probability)
+                forced_attempts = 1 if duplicate and mutation is not None else 0
+                # A probabilistic mutation can theoretically land on another
+                # existing candidate.  Re-check the concrete cipher and keep
+                # forcing mutations until this child is unique.
+                forbidden = existing + self.next_members
+                if self.ismember(child, forbidden):
+                    duplicate = True
+                    mutation_probability = 1.0
+                    extra_mutation, extra_attempts = self._force_unique_mutation(
+                        child, forbidden
+                    )
+                    mutation = extra_mutation
+                    forced_attempts += extra_attempts
+                if mutation is not None:
+                    child.mutation_changes.append({
+                        'operation': 'random_component_mutation',
+                        'candidate_index': child_index,
+                        'forced': bool(duplicate),
+                        'probability': mutation_probability,
+                        'attempts': int(max(1, forced_attempts)) if duplicate else 1,
+                        'details': deepcopy(mutation),
+                    })
                 self.next_members.append(child)
                 self.last_breeding_records.append({
                     'type': 'crossover',
@@ -1039,6 +1180,10 @@ class Generation:
                     'parent_ids': list(getattr(child, 'parent_ids', [])),
                     'strategy': getattr(child, 'crossover_strategy', None),
                     'duplicate_before_llm': bool(duplicate),
+                    'mutation_applied': mutation is not None,
+                    'mutation_forced': bool(duplicate),
+                    'mutation_probability': mutation_probability,
+                    'forced_mutation_attempts': int(forced_attempts),
                     'status': 'created',
                 })
 
@@ -1083,24 +1228,60 @@ class Generation:
             for record in self.last_breeding_records
             if record.get('duplicate_before_llm')
         ]
-        if hasattr(advisor, 'mutate_generation'):
-            mutated_members, mutation_report = advisor.mutate_generation(
-                self.next_members,
-                generation_context=context,
-                engineering_validator=engineering_validator,
-            )
-        elif callable(advisor):
-            result = advisor(self.next_members, context)
-            mutated_members, mutation_report = result
-        else:
-            mutated_members = self.next_members
-            mutation_report = {
-                'status': 'fallback_noop',
-                'fallback_reason': 'invalid_advisor',
-                'change_records': [],
-            }
+        try:
+            if hasattr(advisor, 'mutate_generation'):
+                mutated_members, mutation_report = advisor.mutate_generation(
+                    self.next_members,
+                    generation_context=context,
+                    engineering_validator=engineering_validator,
+                )
+            elif callable(advisor):
+                result = advisor(self.next_members, context)
+                mutated_members, mutation_report = result
+            else:
+                mutated_members = self.next_members
+                mutation_report = {
+                    'status': 'fallback_noop',
+                    'fallback_reason': 'invalid_advisor',
+                    'change_records': [],
+                }
+        except Exception as exc:
+            # ComponentValidationError intentionally interrupts the search after
+            # three failed generations. Preserve its structured report on the
+            # generation before propagating so callers can inspect the failure.
+            failure_report = getattr(exc, 'report', None)
+            if isinstance(failure_report, dict):
+                self.last_mutation_report = deepcopy(failure_report)
+            raise
         self.next_members = list(mutated_members)
         self.last_mutation_report = mutation_report or {}
+        # Keep the final post-advisor population unique as well.  The advisor
+        # works on children only and may legitimately return an unchanged or
+        # newly-colliding candidate.
+        unique_children = []
+        existing = list(self.members) + list(self.fittest_population)
+        for child_index, child in enumerate(self.next_members):
+            forbidden = existing + unique_children
+            if self.ismember(child, forbidden):
+                mutation, attempts = self._force_unique_mutation(child, forbidden)
+                child.mutation_changes.append({
+                    'operation': 'random_component_mutation',
+                    'candidate_index': child_index,
+                    'forced': True,
+                    'probability': 1.0,
+                    'attempts': int(attempts),
+                    'details': deepcopy(mutation),
+                    'reason': 'post_advisor_duplicate',
+                })
+                if child_index < len(self.last_breeding_records):
+                    self.last_breeding_records[child_index].update(
+                        mutation_forced=True,
+                        mutation_probability=1.0,
+                        post_advisor_duplicate=True,
+                        forced_mutation_attempts=int(attempts),
+                    )
+            unique_children.append(child)
+        self.next_members = unique_children
         for record in self.last_mutation_report.get('change_records', []):
             index = record.get('candidate_index')
             if isinstance(index, int) and 0 <= index < len(self.next_members):

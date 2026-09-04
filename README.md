@@ -57,6 +57,18 @@ UKNIT_EVALUATION_MODE=legacy only when the original SAT/Yosys toolchain is
 installed; legacy evaluation still needs Kissat, Espresso, and its original
 runtime dependencies.
 
+## uKNIT baseline file
+
+When `INIT_SETTINGS['INCLUDE_UKNIT']` is enabled, the original code tries to
+load the precomputed full uKNIT-BC cipher from `uknit64_cipher.pkl`. This file
+is a data artifact, not a pip dependency, and it is not included in this
+repository. Set `UKNIT_BASELINE_PATH` to its absolute path (or place it in the
+project root) when the published baseline is available. By default, a missing
+file falls back to a fresh random candidate with the same round shape; this is
+useful for smoke/search runs but does not reproduce a published uKNIT window.
+Set `UKNIT_FALLBACK_RANDOM=false` to require the baseline and fail with a
+clear error when it is absent.
+
 ## DeepSeek configuration
 
 All DeepSeek settings live in deepseek_config.py. The checked-in local values
@@ -77,8 +89,12 @@ the fallback reason.
 The LLM never receives a Member object. It receives JSON-compatible
 candidate/population summaries and returns a constrained mutation plan. The
 framework validates all operations, candidate fingerprints, S-box
-permutations, and linear-layer structure before applying a change. Failed API
-calls and invalid plans are recorded and leave the crossover output unchanged.
+permutations, and linear-layer structure before applying a change. When the
+model produces an illegal component or mutation plan, it receives the
+validation issues and is asked to regenerate, up to three complete generation
+attempts per round. If all three attempts remain invalid, the run stops with a
+component-validation error instead of accepting an invalid candidate. Failed
+API calls remain structured no-op reports.
 
 ## Team B/C plugin handoff
 

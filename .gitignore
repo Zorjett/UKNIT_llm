@@ -1,2 +1,9 @@
 deepseek_config.py
 runs/
+__pycache__/
+analysis/__pycache__/
+cipher/__pycache__/
+team_plugins/__pycache__/
+tests/__pycache__/
+yosys/__pycache__/
+.pytest_cache/

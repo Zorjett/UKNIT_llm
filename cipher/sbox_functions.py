@@ -12,6 +12,14 @@ set_global_seed(SEED)
 
 # count_active_sbox
 class sbox_functions:
+    # Fixed 4-bit MANTIS S-box used as the construction base.  Concrete
+    # round/position S-boxes are derived from this table with independent
+    # input and output bit permutations.
+    MANTIS_SBOX = [
+        0xC, 0xA, 0xD, 0x3, 0xE, 0xB, 0xF, 0x7,
+        0x8, 0x9, 0x1, 0x5, 0x0, 0x2, 0x4, 0x6,
+    ]
+
     # predefined good classes of sboxes
     good_sboxes = [[4, 0, 1, 15, 2, 11, 6, 7, 3, 9, 10, 5, 12, 13, 14, 8], [8, 0, 1, 12, 2, 5, 6, 9, 4, 3, 10, 11, 7, 13, 14, 15], [8, 0, 1, 12, 15, 5, 6, 7, 4, 3, 10, 11, 9, 13, 14, 2], [2, 0, 1, 8, 3, 13, 6, 7, 4, 9, 10, 5, 12, 11, 14, 15], [2, 0, 1, 8, 3, 15, 6, 7, 4, 9, 5, 11, 12, 13, 14, 10], [2, 0, 1, 8, 3, 11, 6, 7, 4, 9, 10, 15, 12, 13, 14, 5], [4, 8, 1, 2, 3, 11, 6, 7, 0, 9, 10, 14, 12, 13, 5, 15], [8, 0, 1, 9, 2, 5, 13, 7, 4, 6, 10, 11, 12, 3, 14, 15], [8, 14, 1, 2, 3, 5, 6, 7, 4, 12, 10, 11, 9, 13, 0, 15], [8, 14, 1, 2, 3, 5, 6, 7, 4, 9, 15, 11, 12, 13, 0, 10], [8, 15, 1, 2, 3, 5, 12, 7, 4, 9, 10, 11, 6, 13, 14, 0], [8, 15, 1, 2, 3, 5, 6, 13, 4, 9, 10, 11, 12, 7, 14, 0], [12, 0, 1, 9, 3, 5, 4, 7, 6, 2, 10, 11, 8, 13, 14, 15], [12, 11, 1, 2, 3, 5, 4, 7, 6, 9, 10, 0, 8, 13, 14, 15], [12, 9, 1, 2, 3, 5, 4, 7, 6, 0, 10, 11, 8, 13, 14, 15], [8, 14, 1, 2, 3, 5, 4, 7, 6, 9, 10, 0, 12, 13, 11, 15], [8, 15, 1, 2, 3, 12, 6, 7, 4, 9, 10, 11, 5, 13, 14, 0], [8, 0, 1, 12, 2, 5, 11, 7, 4, 9, 10, 6, 3, 13, 14, 15], [8, 0, 1, 12, 2, 5, 13, 7, 4, 9, 10, 11, 3, 6, 14, 15], [12, 0, 1, 2, 3, 15, 6, 7, 4, 9, 10, 11, 8, 13, 14, 5], [12, 0, 1, 2, 3, 5, 6, 13, 4, 9, 10, 11, 8, 7, 14, 15]]
     ############ basic sbox functions ############
@@ -25,6 +33,64 @@ class sbox_functions:
         matrix = np.zeros((size, size), dtype=int)
         matrix[np.arange(size), perm] = 1
         return matrix
+
+    @staticmethod
+    def is_bit_permutation_matrix(matrix, size=4):
+        matrix = np.asarray(matrix)
+        return (
+            matrix.shape == (size, size)
+            and np.all(np.isin(matrix, [0, 1]))
+            and np.all(matrix.sum(axis=0) == 1)
+            and np.all(matrix.sum(axis=1) == 1)
+        )
+
+    @staticmethod
+    def swap_bit_positions(matrix, first=None, second=None, axis=1):
+        """Return a legal matrix after exchanging two bit positions.
+
+        ``axis=1`` exchanges input positions (columns, suitable for ``B``);
+        ``axis=0`` exchanges output positions (rows, suitable for ``D``).
+        """
+        matrix = np.asarray(matrix, dtype=int).copy()
+        if not sbox_functions.is_bit_permutation_matrix(matrix):
+            raise ValueError("matrix must be a 4x4 bit-permutation matrix")
+        if axis not in (0, 1):
+            raise ValueError("axis must be 0 (rows) or 1 (columns)")
+        if first is None or second is None:
+            first, second = np.random.choice(4, size=2, replace=False)
+        if first == second or not (0 <= int(first) < 4 and 0 <= int(second) < 4):
+            raise ValueError("bit positions must be two distinct values in 0..3")
+        if axis == 1:
+            matrix[:, [int(first), int(second)]] = matrix[:, [int(second), int(first)]]
+        else:
+            matrix[[int(first), int(second)], :] = matrix[[int(second), int(first)], :]
+        return matrix
+
+    @staticmethod
+    def construct_mantis_sbox(input_permutation=None, output_permutation=None):
+        """Construct ``D o S_MANTIS o B`` as a lookup table.
+
+        ``matrix_transformation_front`` applies the input map and
+        ``matrix_transformation_back`` applies the output map, so the order
+        here matches: input -> B -> MANTIS -> D -> output.
+        """
+        input_permutation = (
+            sbox_functions.get_random_bit_permutation()
+            if input_permutation is None else np.asarray(input_permutation)
+        )
+        output_permutation = (
+            sbox_functions.get_random_bit_permutation()
+            if output_permutation is None else np.asarray(output_permutation)
+        )
+        if not sbox_functions.is_bit_permutation_matrix(input_permutation):
+            raise ValueError("input_permutation must be a 4x4 bit-permutation matrix")
+        if not sbox_functions.is_bit_permutation_matrix(output_permutation):
+            raise ValueError("output_permutation must be a 4x4 bit-permutation matrix")
+        base = list(sbox_functions.MANTIS_SBOX)
+        return sbox_functions.matrix_transformation_back(
+            output_permutation,
+            sbox_functions.matrix_transformation_front(input_permutation, base),
+        )
     
     @staticmethod
     def get_random_linear_permutation(size=4):
@@ -164,8 +230,12 @@ class sbox_functions:
     
     @staticmethod
     def get_mantis_sbox_w_mutation():
-        sbox = [0xc,0xa,0xd,0x3,0xe,0xb,0xf,0x7,0x8,0x9,0x1,0x5,0x0,0x2,0x4,0x6]
-        return sbox_functions.mutate(sbox,init=True)
+        """Return an unchanged copy of the fixed MANTIS base S-box.
+
+        Initialization now applies explicit per-position bit permutations in
+        ``substitution_layer.randomize`` rather than mutating this base table.
+        """
+        return list(sbox_functions.MANTIS_SBOX)
     
 
 class substitution_functions(sbox_functions):

@@ -2,8 +2,26 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 import cipher.Ciphers as ciphers
 import cipher.components as components
+from cipher.linear_functions import linear_functions
+
+
+def _valid_linear_matrix():
+    zero = np.zeros((16, 16), dtype=int)
+    base = linear_functions.get_prince_m1()
+    block = np.block([
+        [base, zero, zero, zero],
+        [zero, base, zero, zero],
+        [zero, zero, base, zero],
+        [zero, zero, zero, base],
+    ])
+    return linear_functions.get_aes_shiftrows().dot(block)
+
+
+VALID_LINEAR_MATRIX = _valid_linear_matrix()
 
 
 def _member(label, offset):
@@ -38,7 +56,7 @@ def _member(label, offset):
         round_function.add_substitution_layer(substitution)
         if round_index < 2:
             round_function.linear = SimpleNamespace(
-                matrix="%s-linear-%s" % (label, round_index)
+                matrix=VALID_LINEAR_MATRIX.copy()
             )
         else:
             round_function.linear = None
@@ -81,11 +99,11 @@ class CrossoverMetadataTests(unittest.TestCase):
         sources = child_a.crossover_details["component_sources"]
         self.assertEqual(
             [entry["source"] for entry in sources],
-            ["parent_a", "parent_a", "parent_b", "parent_b", "parent_b", "parent_b"],
+            ["parent_a", "parent_a", "parent_b", "parent_b", "parent_b"],
         )
         self.assertEqual(
             [entry["source_id"] for entry in sources],
-            ["candidate-A", "candidate-A", "candidate-B", "candidate-B", "candidate-B", "candidate-B"],
+            ["candidate-A", "candidate-A", "candidate-B", "candidate-B", "candidate-B"],
         )
         self.assertEqual(child_a.round_functions[0].substitution.sboxes[0][0], 0)
         self.assertEqual(child_a.round_functions[1].substitution.sboxes[0][0], 2)
@@ -107,11 +125,11 @@ class CrossoverMetadataTests(unittest.TestCase):
         self.assertEqual(child_a.crossover_details["cuts"], [1, 4])
         self.assertEqual(
             [entry["source"] for entry in child_a.crossover_details["component_sources"]],
-            ["parent_a", "parent_b", "parent_b", "parent_b", "parent_a", "parent_a"],
+            ["parent_a", "parent_b", "parent_b", "parent_b", "parent_a"],
         )
         self.assertEqual(
             [entry["source"] for entry in child_b.crossover_details["component_sources"]],
-            ["parent_b", "parent_a", "parent_a", "parent_a", "parent_b", "parent_b"],
+            ["parent_b", "parent_a", "parent_a", "parent_a", "parent_b"],
         )
         self._assert_child_is_reset(child_a)
         self._assert_child_is_reset(child_b)
@@ -124,7 +142,10 @@ class CrossoverMetadataTests(unittest.TestCase):
 
         rounds = child_a.crossover_details["rounds"]
         self.assertEqual(len(rounds), 3)
-        self.assertTrue(all(item["linear_source"] == "parent_a" for item in rounds))
+        self.assertTrue(all(
+            item["linear_source"] == "parent_a" for item in rounds[:-1]
+        ))
+        self.assertIsNone(rounds[-1]["linear_source"])
         self.assertTrue(
             all(source == "parent_a" for item in rounds for source in item["sbox_sources"])
         )
@@ -153,6 +174,38 @@ class CrossoverMetadataTests(unittest.TestCase):
             self.assertIsNone(child_b.round_functions[0].linear)
             self.assertEqual(child_a.crossover_details["cuts"], [1])
             self._assert_child_is_reset(child_a)
+
+    def test_two_round_double_crossover_uses_safe_degenerate_cut(self):
+        parent_a = _member("A", 0)
+        parent_b = _member("B", 1)
+        parent_a.round_functions = parent_a.round_functions[:2]
+        parent_b.round_functions = parent_b.round_functions[:2]
+        parent_a.num_rounds = parent_b.num_rounds = 2
+        parent_a.round_functions[-1].linear = None
+        parent_b.round_functions[-1].linear = None
+
+        with patch.object(ciphers.np.random, "choice", return_value="DOUBLE"):
+            child_a, child_b = parent_a.breed(parent_b)
+        self.assertEqual(child_a.crossover_details["cuts"], [1])
+        self.assertEqual(len(child_a.round_functions), 2)
+        self.assertIsNone(child_a.round_functions[-1].linear)
+        self.assertIsNone(child_b.round_functions[-1].linear)
+
+    def test_crossover_rejects_invalid_numeric_linear_component(self):
+        self.parent_a.round_functions[0].linear.matrix = np.zeros((64, 64), dtype=int)
+        with patch.object(ciphers.np.random, "choice", return_value="SINGLE"), patch.object(
+            ciphers.np.random, "randint", return_value=2
+        ):
+            with self.assertRaises(ValueError):
+                self.parent_a.breed(self.parent_b)
+
+    def test_crossover_rejects_dense_but_invertible_linear_component(self):
+        self.parent_a.round_functions[0].linear.matrix = np.eye(64, dtype=int)
+        with patch.object(ciphers.np.random, "choice", return_value="SINGLE"), patch.object(
+            ciphers.np.random, "randint", return_value=2
+        ):
+            with self.assertRaises(ValueError):
+                self.parent_a.breed(self.parent_b)
 
 
 class BreedingContextTests(unittest.TestCase):

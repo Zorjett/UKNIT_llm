@@ -1,12 +1,13 @@
 """DeepSeek-guided mutation for the uKNIT genetic search.
 
 The module deliberately keeps the language model outside the cipher data model.  A
-generation is serialized once, one ``chat/completions`` request is made, and the
-returned operations are applied to deep copies only after strict schema checks.
+generation is serialized once, the returned operations are applied to deep copies
+only after strict schema checks, and illegal component generations are retried a
+bounded number of times.
 
 The public entry point intended for the search loop is ``mutate_generation``.
-Failures are represented as a no-op report; API or model failures never make the
-genetic loop fail.
+Transport failures remain structured no-op reports; exhausting component
+validation attempts raises ``ComponentValidationError`` and stops the search.
 """
 
 from __future__ import annotations
@@ -22,9 +23,11 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+
+from cipher.linear_functions import linear_functions as _linear_functions
 
 
 try:
@@ -98,6 +101,7 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MAX_TOTAL_OPERATIONS = 64
 DEFAULT_MAX_OPERATIONS_PER_CANDIDATE = 4
 DEFAULT_MAX_RESPONSE_BYTES = 1_000_000 # API响应最大允许1MB
+DEFAULT_MAX_COMPONENT_GENERATION_ATTEMPTS = 10
 
 _ROOT_KEYS = {
     "schema_version",
@@ -210,6 +214,21 @@ class MutationSchemaError(ValueError):
     """The model response does not conform to the mutation-plan schema."""
 
 
+class ComponentValidationError(RuntimeError):
+    """Raised when the model cannot produce valid cipher components in time."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        report: Optional[Mapping[str, Any]] = None,
+        issues: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.report = dict(report or {})
+        self.issues = to_builtin(list(issues or []))
+
+
 @dataclass(frozen=True)
 class DeepSeekSettings:
     """Resolved DeepSeek settings without exposing the API key in reports."""
@@ -225,6 +244,7 @@ class DeepSeekSettings:
     max_total_operations: int = DEFAULT_MAX_TOTAL_OPERATIONS
     max_operations_per_candidate: int = DEFAULT_MAX_OPERATIONS_PER_CANDIDATE
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+    max_component_generation_attempts: int = DEFAULT_MAX_COMPONENT_GENERATION_ATTEMPTS
 
     @classmethod
     def from_sources(
@@ -265,6 +285,10 @@ class DeepSeekSettings:
                     "DEEPSEEK_MAX_RESPONSE_BYTES",
                     "MAX_RESPONSE_BYTES",
                 ),
+                "max_component_generation_attempts": (
+                    "DEEPSEEK_MAX_COMPONENT_GENERATION_ATTEMPTS",
+                    "MAX_COMPONENT_GENERATION_ATTEMPTS",
+                ),
             }
             for destination, aliases in module_aliases.items():
                 for alias in aliases:
@@ -279,6 +303,9 @@ class DeepSeekSettings:
             "base_url": os.getenv("DEEPSEEK_BASE_URL"),
             "timeout_seconds": os.getenv("DEEPSEEK_TIMEOUT_SECONDS"),
             "enabled": os.getenv("DEEPSEEK_ENABLED"),
+            "max_component_generation_attempts": os.getenv(
+                "DEEPSEEK_MAX_COMPONENT_GENERATION_ATTEMPTS"
+            ),
         }
         values.update({key: value for key, value in environment.items() if value not in (None, "")})
 
@@ -320,6 +347,16 @@ class DeepSeekSettings:
                 values.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES),
                 1024,
                 20_000_000,
+            ),
+            # The safety requirement is deliberately capped at three complete
+            # model-generation attempts, even when a local override is larger.
+            max_component_generation_attempts=_bounded_int(
+                values.get(
+                    "max_component_generation_attempts",
+                    DEFAULT_MAX_COMPONENT_GENERATION_ATTEMPTS,
+                ),
+                1,
+                3,
             ),
         )
 
@@ -363,60 +400,176 @@ class DeepSeekMutationAdvisor:
             report["finished_at"] = _utc_now()
             return originals, report
 
-        try:
-            candidates = [
-                _candidate_prompt_payload(member, index) for index, member in enumerate(members)
-            ]
-            prompt_payload = {
-                "schema_version": MUTATION_SCHEMA_VERSION,
-                "request_id": request_id,
-                "generation_context": to_builtin(generation_context or {}),
-                "candidates": candidates,
-            }
-            response = self._request_plan(prompt_payload)
-            operations, schema_rejections, rationale = _parse_plan(
-                response,
-                request_id=request_id,
-                member_count=len(members),
-                max_total_operations=self.settings.max_total_operations,
-                max_operations_per_candidate=self.settings.max_operations_per_candidate,
-                candidate_bindings=_candidate_bindings(members),
-                expected_generation=(generation_context or {}).get("generation"),
+        candidates = [
+            _candidate_prompt_payload(member, index) for index, member in enumerate(members)
+        ]
+        base_prompt_payload = {
+            "schema_version": MUTATION_SCHEMA_VERSION,
+            "request_id": request_id,
+            "generation_context": to_builtin(generation_context or {}),
+            "candidates": candidates,
+        }
+
+        # A model can return a syntactically valid plan which still produces an
+        # illegal component (for example a malformed copied round).  Validate
+        # the complete result after every model generation and ask the model to
+        # regenerate with the concrete issues from the previous attempt.
+        validation_history: list[dict[str, Any]] = []
+        validation_feedback: list[dict[str, Any]] = []
+        max_attempts = _max_component_generation_attempts(self.settings)
+        total_request_attempts = 0
+        for generation_attempt in range(1, max_attempts + 1):
+            prompt_payload = dict(base_prompt_payload)
+            prompt_payload["generation_attempt"] = generation_attempt
+            if validation_feedback:
+                prompt_payload["validation_feedback"] = to_builtin(validation_feedback)
+
+            attempt_request_attempts = 0
+            try:
+                response = self._request_plan(prompt_payload)
+                attempt_request_attempts = max(1, self._last_request_attempts)
+                total_request_attempts += attempt_request_attempts
+                operations, schema_rejections, rationale = _parse_plan(
+                    response,
+                    request_id=request_id,
+                    member_count=len(members),
+                    max_total_operations=self.settings.max_total_operations,
+                    max_operations_per_candidate=self.settings.max_operations_per_candidate,
+                    candidate_bindings=_candidate_bindings(members),
+                    expected_generation=(generation_context or {}).get("generation"),
+                )
+            except MutationSchemaError as exc:
+                if attempt_request_attempts == 0:
+                    total_request_attempts += max(1, self._last_request_attempts)
+                issue = {
+                    "code": "model_response_schema_invalid",
+                    "message": _safe_error_text(exc),
+                    "generation_attempt": generation_attempt,
+                }
+                validation_feedback = [issue]
+                validation_history.append(
+                    {
+                        "generation_attempt": generation_attempt,
+                        "status": "invalid",
+                        "issues": [issue],
+                    }
+                )
+                if generation_attempt < max_attempts:
+                    continue
+                return _raise_component_validation_error(
+                    originals,
+                    report,
+                    validation_history,
+                    validation_feedback,
+                    total_request_attempts,
+                    exc,
+                )
+            except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, OSError) as exc:
+                if attempt_request_attempts == 0:
+                    total_request_attempts += max(1, self._last_request_attempts)
+                report["generation_attempts"] = len(validation_history)
+                report["validation_retries"] = max(0, len(validation_history) - 1)
+                report["validation_history"] = validation_history
+                report["validation_issues"] = validation_feedback
+                report["error_detail"] = _safe_error_text(exc)
+                report["request_attempts"] = total_request_attempts
+                return originals, _fallback(report, "api_error")
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                if attempt_request_attempts == 0:
+                    total_request_attempts += max(1, self._last_request_attempts)
+                report["generation_attempts"] = len(validation_history)
+                report["validation_retries"] = max(0, len(validation_history) - 1)
+                report["validation_history"] = validation_history
+                report["validation_issues"] = validation_feedback
+                report["error_detail"] = _safe_error_text(exc)
+                report["request_attempts"] = total_request_attempts
+                return originals, _fallback(report, "response_error")
+            except Exception as exc:  # The search loop must never fail because the advisor did.
+                if attempt_request_attempts == 0:
+                    total_request_attempts += max(1, self._last_request_attempts)
+                report["generation_attempts"] = len(validation_history)
+                report["validation_retries"] = max(0, len(validation_history) - 1)
+                report["validation_history"] = validation_history
+                report["validation_issues"] = validation_feedback
+                report["error_detail"] = _safe_error_text(exc)
+                report["request_attempts"] = total_request_attempts
+                return originals, _fallback(report, "advisor_error")
+
+            mutated, application_records = apply_mutation_plan(
+                members,
+                operations,
+                engineering_validator=engineering_validator,
+                generation_context=generation_context,
             )
-            report["response_generation"] = response.get("generation") if isinstance(response, Mapping) else None
-            report["request_attempts"] = self._last_request_attempts
-        except MutationSchemaError as exc:
-            report["error_detail"] = _safe_error_text(exc)
-            return originals, _fallback(report, "schema_error")
-        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, OSError) as exc:
-            report["error_detail"] = _safe_error_text(exc)
-            return originals, _fallback(report, "api_error")
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-            report["error_detail"] = _safe_error_text(exc)
-            return originals, _fallback(report, "response_error")
-        except Exception as exc:  # The search loop must never fail because the advisor did.
-            report["error_detail"] = _safe_error_text(exc)
-            return originals, _fallback(report, "advisor_error")
+            structural_issues = _generation_component_issues(
+                mutated,
+                schema_rejections=schema_rejections,
+                application_records=application_records,
+                generation_attempt=generation_attempt,
+            )
+            accepted = sum(record.get("status") == "accepted" for record in application_records)
+            rejected = len(schema_rejections) + sum(
+                record.get("status") == "rejected" for record in application_records
+            )
+            validation_history.append(
+                {
+                    "generation_attempt": generation_attempt,
+                    "status": "invalid" if structural_issues else "valid",
+                    "accepted_count": accepted,
+                    "rejected_count": rejected,
+                    "issues": to_builtin(structural_issues),
+                    "response_generation": (
+                        response.get("generation") if isinstance(response, Mapping) else None
+                    ),
+                    "plans": _plans_from_operations(operations, response),
+                    "change_records": to_builtin(
+                        list(schema_rejections) + list(application_records)
+                    ),
+                    "rationale": rationale,
+                }
+            )
 
-        report["rationale"] = rationale
-        report["plans"] = _plans_from_operations(operations, response)
-        report["change_records"].extend(schema_rejections)
+            if structural_issues:
+                validation_feedback = structural_issues
+                if generation_attempt < max_attempts:
+                    continue
+                return _raise_component_validation_error(
+                    originals,
+                    report,
+                    validation_history,
+                    validation_feedback,
+                    total_request_attempts,
+                    None,
+                )
 
-        mutated, application_records = apply_mutation_plan(
-            members,
-            operations,
-            engineering_validator=engineering_validator,
-            generation_context=generation_context,
+            report["response_generation"] = (
+                response.get("generation") if isinstance(response, Mapping) else None
+            )
+            report["request_attempts"] = total_request_attempts
+            report["generation_attempts"] = generation_attempt
+            report["validation_retries"] = generation_attempt - 1
+            report["validation_history"] = validation_history
+            report["rationale"] = rationale
+            report["plans"] = _plans_from_operations(operations, response)
+            report["change_records"].extend(schema_rejections)
+            report["change_records"].extend(application_records)
+            report["accepted_count"] = accepted
+            report["rejected_count"] = rejected
+            report["status"] = "applied" if accepted else "no_changes"
+            report["fallback_reason"] = None
+            report["finished_at"] = _utc_now()
+            return mutated, report
+
+        # The loop always either returns or raises, but keep a defensive guard
+        # in case a future change alters the attempt bounds.
+        return _raise_component_validation_error(
+            originals,
+            report,
+            validation_history,
+            validation_feedback,
+            total_request_attempts,
+            None,
         )
-        report["change_records"].extend(application_records)
-        accepted = sum(record.get("status") == "accepted" for record in report["change_records"])
-        rejected = sum(record.get("status") == "rejected" for record in report["change_records"])
-        report["accepted_count"] = accepted
-        report["rejected_count"] = rejected
-        report["status"] = "applied" if accepted else "no_changes"
-        report["fallback_reason"] = None
-        report["finished_at"] = _utc_now()
-        return mutated, report
 
     def propose(
         self,
@@ -474,6 +627,7 @@ class DeepSeekMutationAdvisor:
             "max_tokens": self.settings.max_tokens,
             "stream": False,
             "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
         }
         encoded = json.dumps(body, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         request = urllib_request.Request(
@@ -1010,11 +1164,26 @@ def _apply_operation(
             a, b = params["entry_a"], params["entry_b"]
             table[a], table[b] = table[b], table[a]
             sboxes[params["sbox_index"]] = table
+            # A direct table edit is not generally representable as
+            # D o MANTIS o B.  Invalidate stale construction metadata so a
+            # later random mutation uses the safe table-level fallback.
+            for attribute in ("input_permutations", "output_permutations"):
+                matrices = getattr(substitution, attribute, None)
+                if isinstance(matrices, list) and params["sbox_index"] < len(matrices):
+                    matrices[params["sbox_index"]] = None
         elif operation_name == "replace_sbox":
             sboxes[params["sbox_index"]] = list(params["table"])
+            for attribute in ("input_permutations", "output_permutations"):
+                matrices = getattr(substitution, attribute, None)
+                if isinstance(matrices, list) and params["sbox_index"] < len(matrices):
+                    matrices[params["sbox_index"]] = None
         else:
             a, b = params["sbox_a"], params["sbox_b"]
             sboxes[a], sboxes[b] = copy.deepcopy(sboxes[b]), copy.deepcopy(sboxes[a])
+            for attribute in ("input_permutations", "output_permutations"):
+                matrices = getattr(substitution, attribute, None)
+                if isinstance(matrices, list) and max(a, b) < len(matrices):
+                    matrices[a], matrices[b] = copy.deepcopy(matrices[b]), copy.deepcopy(matrices[a])
         return
     if operation_name in {"copy_component", "copy_round"}:
         if members is None:
@@ -1147,11 +1316,16 @@ def _local_structure_issues(candidate: Any) -> list[dict[str, Any]]:
                     "message": f"round {round_index} linear matrix must be binary 64x64",
                 }
             )
-        elif not _is_invertible_binary_rows(rows, 64):
+        elif not _linear_functions.is_valid_linear_matrix(
+            matrix, row_column_weight=3
+        ):
             issues.append(
                 {
-                    "code": "linear_invertibility",
-                    "message": f"round {round_index} linear matrix is singular",
+                    "code": "linear_structure",
+                    "message": (
+                        f"round {round_index} linear matrix must be binary, "
+                        "3-regular, orthogonal, and invertible over GF(2)"
+                    ),
                 }
             )
     return issues
@@ -1327,6 +1501,8 @@ def _system_prompt(settings: DeepSeekSettings) -> str:
         "Indices are zero-based. Do not target a final round with a linear operation. "
         f"Return at most {settings.max_total_operations} total operations and at most "
         f"{settings.max_operations_per_candidate} operations per candidate. "
+        "The user payload may include generation_attempt and validation_feedback from a prior attempt; "
+        "when present, correct every listed issue before returning the next plan. "
         "Use the supplied security, validation, performance, diversity and population state when present. "
         "An empty operations array is valid when no defensible mutation exists."
     )
@@ -1460,6 +1636,11 @@ def _new_report(
         "model": settings.model,
         "candidate_count": member_count,
         "request_attempts": 0,
+        "max_component_generation_attempts": _max_component_generation_attempts(settings),
+        "generation_attempts": 0,
+        "validation_retries": 0,
+        "validation_history": [],
+        "validation_issues": [],
         "response_generation": None,
         "rationale": None,
         "accepted_count": 0,
@@ -1474,6 +1655,121 @@ def _fallback(report: dict[str, Any], reason: str) -> dict[str, Any]:
     report["fallback_reason"] = reason
     report["finished_at"] = _utc_now()
     return report
+
+
+def _generation_component_issues(
+    candidates: Sequence[Any],
+    *,
+    schema_rejections: Sequence[Mapping[str, Any]],
+    application_records: Sequence[Mapping[str, Any]],
+    generation_attempt: int,
+) -> list[dict[str, Any]]:
+    """Collect component/plan legality issues for one complete model attempt.
+
+    ``apply_mutation_plan`` rolls back rejected operations, so checking only the
+    returned candidates would hide malformed model output.  Include those
+    operation-level rejections as feedback, while leaving engineering-plugin
+    rejections to the existing engineering gate.
+    """
+
+    issues: list[dict[str, Any]] = []
+    for rejection in schema_rejections:
+        issues.append(
+            {
+                "code": "model_operation_schema_invalid",
+                "message": rejection.get("error_detail") or "model operation failed schema validation",
+                "operation_index": rejection.get("operation_index"),
+                "candidate_index": (
+                    rejection.get("operation", {}).get("candidate_index")
+                    if isinstance(rejection.get("operation"), Mapping)
+                    else None
+                ),
+                "generation_attempt": generation_attempt,
+            }
+        )
+
+    retryable_reasons = {
+        "candidate_index_out_of_range",
+        "target_candidate_id_mismatch",
+        "base_fingerprint_mismatch",
+        "structural_validation_failed",
+        "final_structural_validation_failed",
+        "application_failed",
+    }
+    for record in application_records:
+        if record.get("status") != "rejected":
+            continue
+        reason = record.get("rejection_reason")
+        if reason not in retryable_reasons:
+            continue
+        issue: dict[str, Any] = {
+            "code": "model_component_invalid",
+            "message": record.get("error_detail") or reason or "model mutation was rejected",
+            "candidate_index": record.get("candidate_index"),
+            "round_index": record.get("round_index"),
+            "component": record.get("component"),
+            "operation": record.get("operation"),
+            "rejection_reason": reason,
+            "generation_attempt": generation_attempt,
+        }
+        details = record.get("validation_issues") or record.get("final_validation_issues")
+        if details:
+            issue["validation_issues"] = to_builtin(details)
+        issues.append(issue)
+
+    for candidate_index, candidate in enumerate(candidates):
+        for issue in _structure_issues(candidate, candidate_index):
+            enriched = dict(to_builtin(issue))
+            enriched.update(
+                candidate_index=candidate_index,
+                generation_attempt=generation_attempt,
+            )
+            issues.append(enriched)
+    return _deduplicate_issues(issues)
+
+
+def _raise_component_validation_error(
+    originals: Sequence[Any],
+    report: dict[str, Any],
+    validation_history: Sequence[Mapping[str, Any]],
+    validation_issues: Sequence[Mapping[str, Any]],
+    request_attempts: int,
+    cause: Optional[BaseException],
+) -> NoReturn:
+    """Finalize an error report and interrupt the search after three attempts."""
+
+    del originals  # Kept in the signature to make the failure path explicit.
+    issues = to_builtin(list(validation_issues))
+    report["status"] = "error"
+    report["fallback_reason"] = "component_validation_failed"
+    report["request_attempts"] = int(request_attempts)
+    report["generation_attempts"] = len(validation_history)
+    report["validation_retries"] = max(0, len(validation_history) - 1)
+    report["validation_history"] = to_builtin(list(validation_history))
+    report["validation_issues"] = issues
+    if validation_history:
+        latest = validation_history[-1]
+        report["response_generation"] = latest.get("response_generation")
+        report["plans"] = to_builtin(latest.get("plans", []))
+        report["rationale"] = latest.get("rationale")
+        report["change_records"] = to_builtin(latest.get("change_records", []))
+        report["accepted_count"] = int(latest.get("accepted_count", 0) or 0)
+        report["rejected_count"] = int(latest.get("rejected_count", 0) or 0)
+    report["error_detail"] = (
+        _safe_error_text(cause)
+        if cause is not None
+        else (
+            "model generated illegal cipher components after %d attempts"
+            % len(validation_history)
+        )
+    )
+    report["finished_at"] = _utc_now()
+    raise ComponentValidationError(
+        "LLM generated illegal cipher components after %d attempts"
+        % len(validation_history),
+        report=report,
+        issues=issues,
+    )
 
 
 def _member_metrics(member: Any) -> dict[str, Any]:
@@ -1866,6 +2162,17 @@ def _bounded_int(value: Any, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def _max_component_generation_attempts(settings: DeepSeekSettings) -> int:
+    """Return the hard-capped number of complete model generations allowed."""
+
+    try:
+        value = int(settings.max_component_generation_attempts)
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_COMPONENT_GENERATION_ATTEMPTS
+    # return max(1, value)
+    return max(1, min(3, value))
+
+
 def _bounded_float(value: Any, minimum: float, maximum: float) -> float:
     parsed = float(value)
     return max(minimum, min(maximum, parsed))
@@ -1876,6 +2183,7 @@ __all__ = [
     "DeepSeekSettings",
     "MUTATION_SCHEMA_VERSION",
     "MutationSchemaError",
+    "ComponentValidationError",
     "apply_mutation_plan",
     "mutate_generation",
 ]

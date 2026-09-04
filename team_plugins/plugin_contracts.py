@@ -279,6 +279,38 @@ def _is_invertible_binary_matrix(matrix: list[list[int]]) -> bool:
     return rank == size
 
 
+def _is_orthogonal_binary_matrix(matrix: list[list[int]]) -> bool:
+    """Check ``M^T M = I`` over GF(2) using packed matrix columns."""
+
+    if not _is_binary_matrix(matrix):
+        return False
+    size = len(matrix)
+    columns = []
+    for column in range(size):
+        packed = 0
+        for row in matrix:
+            packed = (packed << 1) | row[column]
+        columns.append(packed)
+    return all(
+        (bin(columns[left] & columns[right]).count('1') % 2)
+        == int(left == right)
+        for left in range(size)
+        for right in range(size)
+    )
+
+
+def _has_regular_linear_weight(matrix: list[list[int]], weight: int = 3) -> bool:
+    """Check the uKNIT-BC row and column Hamming-weight invariant."""
+
+    return (
+        all(sum(row) == weight for row in matrix)
+        and all(
+            sum(matrix[row][column] for row in range(len(matrix))) == weight
+            for column in range(len(matrix))
+        )
+    )
+
+
 def validate_candidate_payload(
     candidate: Any,
     require_invertible: bool = True,
@@ -411,6 +443,22 @@ def validate_candidate_payload(
                 _issue(
                     "invalid_linear_matrix",
                     "linear_matrix must be a 64x64 binary integer matrix",
+                    f"{round_path}.linear_matrix",
+                )
+            )
+        elif not _has_regular_linear_weight(matrix, 3):
+            issues.append(
+                _issue(
+                    "invalid_linear_weight",
+                    "linear_matrix must have exactly three 1s in every row and column",
+                    f"{round_path}.linear_matrix",
+                )
+            )
+        elif not _is_orthogonal_binary_matrix(matrix):
+            issues.append(
+                _issue(
+                    "non_orthogonal_linear_matrix",
+                    "linear_matrix must satisfy M^T M = I over GF(2)",
                     f"{round_path}.linear_matrix",
                 )
             )

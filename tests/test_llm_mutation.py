@@ -4,11 +4,11 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-import numpy as np
-
 from cipher.Ciphers import Member
 import cipher.components as components
+from cipher.linear_functions import linear_functions
 from llm_mutation import (
+    ComponentValidationError,
     DeepSeekMutationAdvisor,
     DeepSeekSettings,
     apply_mutation_plan,
@@ -30,7 +30,7 @@ def _member(label, offset=0):
         round_function.add_substitution_layer(substitution)
         if round_index == 0:
             linear = components.linear_layer()
-            linear.matrix = np.eye(64, dtype=int)
+            linear.matrix = linear_functions.get_linear()
             round_function.add_linear_layer(linear)
         else:
             round_function.linear = None
@@ -319,6 +319,129 @@ class DeepSeekTransportTests(unittest.TestCase):
             result = advisor._request_plan({"request_id": "x"})
         self.assertEqual(result["operations"], [])
         self.assertEqual(len(calls), 2)
+
+
+class DeepSeekComponentValidationRetryTests(unittest.TestCase):
+    @staticmethod
+    def _response_for_plan(plan):
+        class Response:
+            def read(self, limit):
+                del limit
+                return json.dumps({"choices": [{"message": {"content": json.dumps(plan)}}]}).encode(
+                    "utf-8"
+                )
+
+            def close(self):
+                return None
+
+        return Response()
+
+    @staticmethod
+    def _invalid_sbox_plan(request_id):
+        return {
+            "schema_version": "1.0",
+            "request_id": request_id,
+            "operations": [
+                {
+                    "candidate_index": 0,
+                    "round_index": 0,
+                    "component": "sbox",
+                    "operation": "replace_sbox",
+                    "params": {"sbox_index": 0, "table": [0] * 16},
+                    "reason": "invalid test S-box",
+                }
+            ],
+        }
+
+    @staticmethod
+    def _empty_plan(request_id):
+        return {"schema_version": "1.0", "request_id": request_id, "operations": []}
+
+    @staticmethod
+    def _valid_sbox_swap_plan(request_id):
+        return {
+            "schema_version": "1.0",
+            "request_id": request_id,
+            "operations": [
+                {
+                    "candidate_index": 0,
+                    "round_index": 0,
+                    "component": "sbox",
+                    "operation": "swap_sbox_entries",
+                    "params": {"sbox_index": 0, "entry_a": 0, "entry_b": 1},
+                    "reason": "valid test S-box mutation",
+                }
+            ],
+        }
+
+    def test_invalid_sbox_is_regenerated_and_valid_attempt_is_applied(self):
+        member = _member("child")
+        calls = []
+
+        def urlopen(request, timeout):
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            request_id = calls[-1]["messages"][1]["content"]
+            payload = json.loads(request_id)
+            if len(calls) == 1:
+                plan = self._invalid_sbox_plan(payload["request_id"])
+            else:
+                plan = self._valid_sbox_swap_plan(payload["request_id"])
+            return self._response_for_plan(plan)
+
+        advisor = DeepSeekMutationAdvisor(
+            DeepSeekSettings(
+                api_key="key",
+                model="model",
+                max_retries=0,
+                max_component_generation_attempts=3,
+            ),
+            urlopen=urlopen,
+        )
+        mutated, report = advisor.mutate_generation([member])
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(report["status"], "applied")
+        self.assertEqual(report["generation_attempts"], 2)
+        self.assertEqual(report["validation_retries"], 1)
+        self.assertEqual(
+            [item["status"] for item in report["validation_history"]],
+            ["invalid", "valid"],
+        )
+        self.assertIn("validation_feedback", json.loads(calls[1]["messages"][1]["content"]))
+        self.assertEqual(report["accepted_count"], 1)
+        self.assertNotEqual(mutated[0].candidate_fingerprint(), member.candidate_fingerprint())
+
+    def test_three_invalid_component_generations_interrupt_with_report(self):
+        member = _member("child")
+        calls = []
+
+        def urlopen(request, timeout):
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            payload = json.loads(calls[-1]["messages"][1]["content"])
+            return self._response_for_plan(self._invalid_sbox_plan(payload["request_id"]))
+
+        advisor = DeepSeekMutationAdvisor(
+            DeepSeekSettings(
+                api_key="key",
+                model="model",
+                max_retries=0,
+                max_component_generation_attempts=3,
+            ),
+            urlopen=urlopen,
+        )
+        with self.assertRaises(ComponentValidationError) as raised:
+            advisor.mutate_generation([member])
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(raised.exception.report["status"], "error")
+        self.assertEqual(
+            raised.exception.report["fallback_reason"], "component_validation_failed"
+        )
+        self.assertEqual(raised.exception.report["generation_attempts"], 3)
+        self.assertEqual(raised.exception.report["validation_retries"], 2)
+        self.assertTrue(raised.exception.issues)
 
 
 if __name__ == "__main__":

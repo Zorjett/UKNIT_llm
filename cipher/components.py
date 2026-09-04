@@ -136,7 +136,16 @@ class linear_layer:
         self.matrix = best_matrices[idx].copy()
 
     def mutate(self):
-        self.matrix = linear_functions.mutate(self.matrix)
+        if self.matrix is None:
+            raise ValueError('cannot mutate an uninitialized linear layer')
+        matrix = np.asarray(self.matrix)
+        if not linear_functions.is_valid_linear_matrix(matrix, row_column_weight=3):
+            raise ValueError('linear layer must be a valid 64x64 binary 3-regular matrix')
+        mutated, details = linear_functions.mutate(matrix, return_details=True)
+        if not linear_functions.is_valid_linear_matrix(mutated, row_column_weight=3):
+            raise ValueError('linear-layer mutation produced an invalid matrix')
+        self.matrix = mutated
+        return details
     def is_equal(self,linear):
         return np.array_equal(self.matrix,linear.matrix)
 
@@ -144,21 +153,109 @@ class substitution_layer:
     def __init__(self):
         self.sboxes = []
         self.num_sboxes = 0
+        self.round_index = None
+        # Per-position bit permutations used to construct the S-boxes.
+        self.input_permutations = []
+        self.output_permutations = []
 
-    def add_sbox(self,sbox):
+    def __setstate__(self, state):
+        """Load substitution layers created before B/D metadata existed."""
+        self.__dict__.update(state)
+        self.sboxes = list(getattr(self, 'sboxes', []) or [])
+        self.num_sboxes = len(self.sboxes)
+        if not hasattr(self, 'round_index'):
+            self.round_index = None
+        if not hasattr(self, 'input_permutations'):
+            self.input_permutations = [None] * self.num_sboxes
+        if not hasattr(self, 'output_permutations'):
+            self.output_permutations = [None] * self.num_sboxes
+
+    @property
+    def B_matrices(self):
+        return self.input_permutations
+
+    @property
+    def D_matrices(self):
+        return self.output_permutations
+
+    def add_sbox(self, sbox, input_permutation=None, output_permutation=None):
         self.sboxes.append(sbox)
+        self.input_permutations.append(input_permutation)
+        self.output_permutations.append(output_permutation)
         self.num_sboxes += 1
 
-    def randomize(self):
+    def randomize(self, round_index=None):
         if config.INIT_SETTINGS['SBOX']['MANTIS_ONLY']: # special consideration for mantis
-            self.sboxes = [sbox_functions.get_mantis_sbox_w_mutation() for _ in range(16)]
+            self.input_permutations = [
+                sbox_functions.get_random_bit_permutation() for _ in range(16)
+            ]
+            self.output_permutations = [
+                sbox_functions.get_random_bit_permutation() for _ in range(16)
+            ]
+            self.sboxes = [
+                sbox_functions.construct_mantis_sbox(input_permutation, output_permutation)
+                for input_permutation, output_permutation in zip(
+                    self.input_permutations, self.output_permutations
+                )
+            ]
         elif config.INIT_SETTINGS['SBOX']['MAX_4_DIFF_UNIFORMITY']:
             self.sboxes = [sbox_functions.get_good_sbox() for _ in range(16)]
+            self.input_permutations = [None] * len(self.sboxes)
+            self.output_permutations = [None] * len(self.sboxes)
         self.num_sboxes = len(self.sboxes)
 
     def mutate(self):
-        index = np.random.randint(0,16)
-        self.sboxes[index] = sbox_functions.mutate(self.sboxes[index])
+        """Mutate one S-box by swapping two bits in B or D.
+
+        For MANTIS-derived S-boxes the selected side is changed, then the
+        concrete lookup table is rebuilt as ``D o MANTIS o B``.  Both sides
+        may change across separate mutation events, but one event changes only
+        one of them.  Legacy layers without B/D metadata use a terminating
+        two-entry swap fallback so they remain mutable and bijective.
+        """
+        if not self.sboxes:
+            return None
+        index = int(np.random.randint(0, len(self.sboxes)))
+        has_metadata = (
+            len(self.input_permutations) == len(self.sboxes)
+            and len(self.output_permutations) == len(self.sboxes)
+            and sbox_functions.is_bit_permutation_matrix(self.input_permutations[index])
+            and sbox_functions.is_bit_permutation_matrix(self.output_permutations[index])
+        )
+        if not has_metadata:
+            table = list(self.sboxes[index])
+            first, second = np.random.choice(len(table), size=2, replace=False)
+            table[int(first)], table[int(second)] = table[int(second)], table[int(first)]
+            if sorted(table) != list(range(len(table))):
+                raise ValueError("mutation would make a non-bijective S-box")
+            self.sboxes[index] = table
+            return {
+                'sbox_index': index,
+                'side': 'table_fallback',
+                'bit_positions': [int(first), int(second)],
+            }
+
+        side = str(np.random.choice(['B', 'D']))
+        matrices = self.input_permutations if side == 'B' else self.output_permutations
+        old_matrix = np.asarray(matrices[index], dtype=int)
+        first, second = np.random.choice(4, size=2, replace=False)
+        axis = 1 if side == 'B' else 0
+        new_matrix = sbox_functions.swap_bit_positions(old_matrix, first, second, axis=axis)
+        new_input = new_matrix if side == 'B' else self.input_permutations[index]
+        new_output = new_matrix if side == 'D' else self.output_permutations[index]
+        new_sbox = sbox_functions.construct_mantis_sbox(new_input, new_output)
+        if sorted(new_sbox) != list(range(16)):
+            raise ValueError("mutation would make a non-bijective S-box")
+        matrices[index] = new_matrix
+        self.sboxes[index] = new_sbox
+        return {
+            'sbox_index': index,
+            'side': side,
+            'axis': 'columns' if axis == 1 else 'rows',
+            'bit_positions': [int(first), int(second)],
+            'input_permutation': self.input_permutations[index].tolist(),
+            'output_permutation': self.output_permutations[index].tolist(),
+        }
     
     def is_equal(self,subst):
         for i in range(len(self.sboxes)):
@@ -241,12 +338,10 @@ class round_function:
 
     def mutate(self):
         if self.linear == None:
-            self.substitution.mutate()
-        else:
-            if np.random.randint(0,2) == 0:
-                self.substitution.mutate()
-            else:
-                self.linear.mutate()
+            return {'component': 'sbox', 'details': self.substitution.mutate()}
+        if np.random.randint(0,2) == 0:
+            return {'component': 'sbox', 'details': self.substitution.mutate()}
+        return {'component': 'linear', 'details': self.linear.mutate()}
 
     def is_equal(self,rf):
         if self.linear != None:
