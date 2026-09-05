@@ -1,9 +1,8 @@
-"""DeepSeek-guided mutation for the uKNIT genetic search.
+"""DeepSeek-guided structural decisions for the uKNIT genetic search.
 
-The module deliberately keeps the language model outside the cipher data model.  A
-generation is serialized once, the returned operations are applied to deep copies
-only after strict schema checks, and illegal component generations are retried a
-bounded number of times.
+The language model returns only a target, a transformation matrix, or a
+crossover starting component.  The framework materializes components locally,
+validates them, and retries invalid decisions a bounded number of times.
 
 The public entry point intended for the search loop is ``mutate_generation``.
 Transport failures remain structured no-op reports; exhausting component
@@ -21,6 +20,7 @@ import os
 import re
 import time
 import uuid
+import numpy as np
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, NoReturn, Optional, Sequence
@@ -28,6 +28,8 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from cipher.linear_functions import linear_functions as _linear_functions
+from cipher.sbox_functions import sbox_functions as _sbox_functions
+import cipher.components as _components
 
 
 try:
@@ -110,7 +112,53 @@ _ROOT_KEYS = {
     "operations",
     "plans",
     "rationale",
+    "actions",
 }
+_ACTION_KEYS = {
+    "action_type",
+    "target_candidate_id",
+    "base_fingerprint",
+    "parent_candidate_ids",
+    "round_index",
+    "component",
+    "sbox_index",
+    "transformation_matrix",
+    "start_component",
+}
+
+
+def _is_binary_matrix(value: Any) -> bool:
+    try:
+        rows = list(value)
+        return (
+            len(rows) == 64
+            and all(isinstance(row, (list, tuple)) and len(row) == 64 for row in rows)
+            and all(value in (0, 1) and not isinstance(value, bool) for row in rows for value in row)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_valid_mantis_sbox_payload(value: Any, input_permutation: Any, output_permutation: Any) -> tuple[bool, list[int] | None]:
+    """Validate B/D and return the concrete ``D o S_MANTIS o B`` table."""
+    if not _sbox_functions.is_bit_permutation_matrix(input_permutation):
+        return False, None
+    if not _sbox_functions.is_bit_permutation_matrix(output_permutation):
+        return False, None
+    try:
+        constructed = list(
+            _sbox_functions.construct_mantis_sbox(input_permutation, output_permutation)
+        )
+    except (TypeError, ValueError):
+        return False, None
+    if value is not None:
+        try:
+            supplied = list(value)
+        except TypeError:
+            return False, None
+        if supplied != constructed:
+            return False, None
+    return sorted(constructed) == list(range(16)), constructed
 _PLAN_KEYS = {
     "target_candidate_id",
     "base_fingerprint",
@@ -408,6 +456,9 @@ class DeepSeekMutationAdvisor:
             "request_id": request_id,
             "generation_context": to_builtin(generation_context or {}),
             "candidates": candidates,
+            "candidate_scores": {
+                item["candidate_id"]: item.get("score", 0.0) for item in candidates
+            },
         }
 
         # A model can return a syntactically valid plan which still produces an
@@ -429,15 +480,28 @@ class DeepSeekMutationAdvisor:
                 response = self._request_plan(prompt_payload)
                 attempt_request_attempts = max(1, self._last_request_attempts)
                 total_request_attempts += attempt_request_attempts
-                operations, schema_rejections, rationale = _parse_plan(
-                    response,
-                    request_id=request_id,
-                    member_count=len(members),
-                    max_total_operations=self.settings.max_total_operations,
-                    max_operations_per_candidate=self.settings.max_operations_per_candidate,
-                    candidate_bindings=_candidate_bindings(members),
-                    expected_generation=(generation_context or {}).get("generation"),
-                )
+                if isinstance(response, Mapping) and "actions" in response:
+                    operations, schema_rejections, rationale = _parse_action_plan(
+                        response,
+                        request_id=request_id,
+                        candidate_bindings=_candidate_bindings(members),
+                        expected_generation=(generation_context or {}).get("generation"),
+                        max_actions=self.settings.max_total_operations,
+                    )
+                    action_mode = True
+                else:
+                    # Backward-compatible reader for old saved fixtures. New
+                    # prompts never advertise or request this legacy format.
+                    operations, schema_rejections, rationale = _parse_plan(
+                        response,
+                        request_id=request_id,
+                        member_count=len(members),
+                        max_total_operations=self.settings.max_total_operations,
+                        max_operations_per_candidate=self.settings.max_operations_per_candidate,
+                        candidate_bindings=_candidate_bindings(members),
+                        expected_generation=(generation_context or {}).get("generation"),
+                    )
+                    action_mode = False
             except MutationSchemaError as exc:
                 if attempt_request_attempts == 0:
                     total_request_attempts += max(1, self._last_request_attempts)
@@ -495,12 +559,20 @@ class DeepSeekMutationAdvisor:
                 report["request_attempts"] = total_request_attempts
                 return originals, _fallback(report, "advisor_error")
 
-            mutated, application_records = apply_mutation_plan(
-                members,
-                operations,
-                engineering_validator=engineering_validator,
-                generation_context=generation_context,
-            )
+            if action_mode:
+                mutated, application_records = apply_action_plan(
+                    members,
+                    operations,
+                    engineering_validator=engineering_validator,
+                    generation_context=generation_context,
+                )
+            else:
+                mutated, application_records = apply_mutation_plan(
+                    members,
+                    operations,
+                    engineering_validator=engineering_validator,
+                    generation_context=generation_context,
+                )
             structural_issues = _generation_component_issues(
                 mutated,
                 schema_rejections=schema_rejections,
@@ -521,7 +593,10 @@ class DeepSeekMutationAdvisor:
                     "response_generation": (
                         response.get("generation") if isinstance(response, Mapping) else None
                     ),
-                    "plans": _plans_from_operations(operations, response),
+                    "plans": (
+                        to_builtin(operations)
+                        if action_mode else _plans_from_operations(operations, response)
+                    ),
                     "change_records": to_builtin(
                         list(schema_rejections) + list(application_records)
                     ),
@@ -550,7 +625,10 @@ class DeepSeekMutationAdvisor:
             report["validation_retries"] = generation_attempt - 1
             report["validation_history"] = validation_history
             report["rationale"] = rationale
-            report["plans"] = _plans_from_operations(operations, response)
+            report["plans"] = (
+                to_builtin(operations)
+                if action_mode else _plans_from_operations(operations, response)
+            )
             report["change_records"].extend(schema_rejections)
             report["change_records"].extend(application_records)
             report["accepted_count"] = accepted
@@ -591,22 +669,31 @@ class DeepSeekMutationAdvisor:
                 "candidates": candidates,
             }
         )
-        operations, rejections, rationale = _parse_plan(
-            response,
-            request_id=actual_request_id,
-            member_count=len(members),
-            max_total_operations=self.settings.max_total_operations,
-            max_operations_per_candidate=self.settings.max_operations_per_candidate,
-            candidate_bindings=_candidate_bindings(members),
-            expected_generation=(generation_context or {}).get("generation"),
-        )
+        if "actions" in response:
+            operations, rejections, rationale = _parse_action_plan(
+                response,
+                request_id=actual_request_id,
+                candidate_bindings=_candidate_bindings(members),
+                expected_generation=(generation_context or {}).get("generation"),
+                max_actions=self.settings.max_total_operations,
+            )
+        else:
+            operations, rejections, rationale = _parse_plan(
+                response,
+                request_id=actual_request_id,
+                member_count=len(members),
+                max_total_operations=self.settings.max_total_operations,
+                max_operations_per_candidate=self.settings.max_operations_per_candidate,
+                candidate_bindings=_candidate_bindings(members),
+                expected_generation=(generation_context or {}).get("generation"),
+            )
         return {
             "schema_version": MUTATION_SCHEMA_VERSION,
             "request_id": actual_request_id,
             "generation": response.get("generation") if isinstance(response, Mapping) else None,
-            "plans": _plans_from_operations(operations, response),
-            # Keep the flat form for callers written against the first scaffold.
-            "operations": operations,
+            "actions": to_builtin(operations) if "actions" in response else [],
+            "plans": _plans_from_operations(operations, response) if "actions" not in response else [],
+            "operations": operations if "actions" not in response else [],
             "rejections": rejections,
             "rationale": rationale,
         }
@@ -820,6 +907,511 @@ def apply_mutation_plan(
                 after_fingerprint=_member_fingerprint(mutated[candidate_index]),
             )
 
+    return mutated, records
+
+
+def _parse_action_plan_legacy(
+    payload: Mapping[str, Any],
+    *,
+    request_id: str,
+    candidate_bindings: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
+    expected_generation: Any = None,
+    max_actions: int = DEFAULT_MAX_TOTAL_OPERATIONS,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Optional[str]]:
+    """Parse the single public LLM action format.
+
+    The model is intentionally not given mutation/crossover operator names.  It
+    returns either a concrete mutation description or a concrete child result;
+    this parser only checks references and basic shapes before application.
+    """
+    if not isinstance(payload, Mapping):
+        raise MutationSchemaError("action plan must be a JSON object")
+    unknown = set(payload) - _ROOT_KEYS
+    if unknown:
+        raise MutationSchemaError("unknown action-plan fields: " + ", ".join(sorted(map(str, unknown))))
+    if payload.get("schema_version") != MUTATION_SCHEMA_VERSION:
+        raise MutationSchemaError("unsupported action-plan schema version")
+    if payload.get("request_id") != request_id:
+        raise MutationSchemaError("action-plan request_id does not match the request")
+    generation = payload.get("generation")
+    if generation is not None and not _is_int(generation):
+        raise MutationSchemaError("generation must be an integer or null")
+    # Generation is informational metadata.  A model may describe the target
+    # as the next generation, so do not discard an otherwise valid action plan
+    # solely because this echo field differs from the request.
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        raise MutationSchemaError("actions must be an array")
+    if len(actions) > int(max_actions):
+        raise MutationSchemaError("maximum action count exceeded")
+    rationale = payload.get("rationale")
+    if rationale is not None and not isinstance(rationale, str):
+        raise MutationSchemaError("rationale must be a string or null")
+    bindings = _binding_entries(candidate_bindings)
+    bound_ids = {str(item.get("candidate_id")): int(item.get("candidate_index")) for item in bindings}
+    parsed: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for index, raw in enumerate(actions):
+        try:
+            if not isinstance(raw, Mapping):
+                raise MutationSchemaError("action must be an object")
+            unknown_action = set(raw) - _ACTION_KEYS
+            if unknown_action:
+                raise MutationSchemaError("unknown action fields: " + ", ".join(sorted(map(str, unknown_action))))
+            action_type = raw.get("action_type")
+            if action_type not in {"mutation", "crossover"}:
+                raise MutationSchemaError("action_type must be mutation or crossover")
+            target_id = raw.get("target_candidate_id")
+            if not isinstance(target_id, str) or not target_id.strip():
+                raise MutationSchemaError("target_candidate_id must be a non-empty string")
+            if str(target_id) not in bound_ids:
+                raise MutationSchemaError("target_candidate_id is not bound to a candidate")
+            result = {
+                "action_type": action_type,
+                "target_candidate_id": str(target_id),
+                "candidate_index": bound_ids[str(target_id)],
+                "base_fingerprint": raw.get("base_fingerprint"),
+                "reason": raw.get("reason"),
+            }
+            if result["base_fingerprint"] is not None and not isinstance(result["base_fingerprint"], str):
+                raise MutationSchemaError("base_fingerprint must be a string or null")
+            if result["reason"] is not None and not isinstance(result["reason"], str):
+                raise MutationSchemaError("reason must be a string or null")
+            if action_type == "mutation":
+                changes = raw.get("changes")
+                if not isinstance(changes, list) or not changes:
+                    raise MutationSchemaError("mutation action requires a non-empty changes array")
+                normalized = []
+                for change in changes:
+                    if not isinstance(change, Mapping):
+                        raise MutationSchemaError("each mutation change must be an object")
+                    if set(change) - {
+                        "round_index", "component", "sbox_index", "value",
+                        "input_permutation", "output_permutation",
+                    }:
+                        raise MutationSchemaError("unknown mutation change fields")
+                    round_index = change.get("round_index")
+                    component = change.get("component")
+                    if not _is_int(round_index) or int(round_index) < 0:
+                        raise MutationSchemaError("change round_index must be a non-negative integer")
+                    if component not in {"sbox", "linear"}:
+                        raise MutationSchemaError("change component must be sbox or linear")
+                    value = change.get("value")
+                    if component == "sbox":
+                        sbox_index = change.get("sbox_index")
+                        if not _is_int(sbox_index) or not 0 <= int(sbox_index) < 16:
+                            raise MutationSchemaError("sbox_index must be in 0..15")
+                        input_permutation = change.get("input_permutation")
+                        output_permutation = change.get("output_permutation")
+                        if input_permutation is None or output_permutation is None:
+                            raise MutationSchemaError(
+                                "new-format S-box mutation must provide both input_permutation and output_permutation"
+                            )
+                        valid, constructed = _is_valid_mantis_sbox_payload(
+                            value, input_permutation, output_permutation
+                        )
+                        if not valid or constructed is None:
+                            raise MutationSchemaError(
+                                "S-box must satisfy D o S_MANTIS o B and be a permutation of 0..15"
+                            )
+                        value = constructed
+                        normalized.append({"round_index": int(round_index), "component": component,
+                                           "sbox_index": int(sbox_index), "value": list(value),
+                                           "input_permutation": to_builtin(input_permutation),
+                                           "output_permutation": to_builtin(output_permutation)})
+                    else:
+                        if not _is_binary_matrix(value) or not _linear_functions.is_valid_linear_matrix(
+                            value, row_column_weight=3
+                        ):
+                            raise MutationSchemaError(
+                                "linear value must be binary 64x64, 3-regular, invertible and orthogonal over GF(2)"
+                            )
+                        normalized.append({"round_index": int(round_index), "component": component,
+                                           "value": value})
+                result["changes"] = normalized
+            else:
+                parents = raw.get("parent_candidate_ids")
+                if not isinstance(parents, list) or len(parents) != 2 or any(not isinstance(item, str) for item in parents):
+                    raise MutationSchemaError("crossover requires exactly two parent_candidate_ids")
+                if parents[0] == parents[1] or any(item not in bound_ids for item in parents):
+                    raise MutationSchemaError("crossover parent ids must reference two distinct candidates")
+                child = raw.get("child")
+                if not isinstance(child, Mapping) or not isinstance(child.get("rounds"), list) or not child["rounds"]:
+                    raise MutationSchemaError("crossover requires child.rounds")
+                child_rounds = child["rounds"]
+                for child_round_index, child_round in enumerate(child_rounds):
+                    if not isinstance(child_round, Mapping):
+                        raise MutationSchemaError("each child round must be an object")
+                    sboxes = child_round.get("sboxes")
+                    if not isinstance(sboxes, list) or len(sboxes) != 16:
+                        raise MutationSchemaError("each child round must contain 16 S-box objects")
+                    for sbox in sboxes:
+                        if not isinstance(sbox, Mapping):
+                            raise MutationSchemaError(
+                                "crossover S-boxes must provide value, input_permutation and output_permutation"
+                            )
+                        valid, constructed = _is_valid_mantis_sbox_payload(
+                            sbox.get("value"),
+                            sbox.get("input_permutation"),
+                            sbox.get("output_permutation"),
+                        )
+                        if not valid or constructed is None:
+                            raise MutationSchemaError(
+                                "crossover child contains an invalid MANTIS-derived S-box"
+                            )
+                    matrix = child_round.get("linear_matrix")
+                    if child_round_index == len(child_rounds) - 1:
+                        if matrix is not None:
+                            raise MutationSchemaError("final child round must have linear_matrix null")
+                    elif not _linear_functions.is_valid_linear_matrix(matrix, row_column_weight=3):
+                        raise MutationSchemaError(
+                            "non-final child linear_matrix must be a valid 3-regular orthogonal 64x64 matrix"
+                        )
+                result["parent_candidate_ids"] = list(parents)
+                normalized_rounds = []
+                for child_round in child_rounds:
+                    normalized_sboxes = []
+                    for sbox in child_round["sboxes"]:
+                        valid, constructed = _is_valid_mantis_sbox_payload(
+                            sbox.get("value"), sbox.get("input_permutation"), sbox.get("output_permutation")
+                        )
+                        if not valid or constructed is None:
+                            raise MutationSchemaError("crossover child contains an invalid MANTIS-derived S-box")
+                        normalized_sboxes.append({
+                            "value": constructed,
+                            "input_permutation": to_builtin(sbox.get("input_permutation")),
+                            "output_permutation": to_builtin(sbox.get("output_permutation")),
+                        })
+                    normalized_rounds.append({
+                        "sboxes": normalized_sboxes,
+                        "linear_matrix": to_builtin(child_round.get("linear_matrix")),
+                    })
+                result["child"] = {"rounds": normalized_rounds}
+            parsed.append(result)
+        except MutationSchemaError as exc:
+            rejected.append({"action_index": index, "status": "rejected",
+                             "rejection_reason": "schema_validation_failed",
+                             "error_detail": _safe_error_text(exc), "action": to_builtin(raw)})
+    return parsed, rejected, rationale[:2000] if rationale else None
+
+
+def apply_action_plan_legacy(
+    members: Sequence[Any],
+    actions: Sequence[Mapping[str, Any]],
+    engineering_validator: Optional[Any] = None,
+    generation_context: Optional[Mapping[str, Any]] = None,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Apply normalized mutation/crossover actions to deep-copied candidates."""
+    originals = [copy.deepcopy(member) for member in members]
+    mutated = [copy.deepcopy(member) for member in members]
+    bindings = _binding_entries(_candidate_bindings(originals))
+    id_to_index = {str(item.get("candidate_id")): int(item.get("candidate_index")) for item in bindings}
+    records = []
+    for action_index, action in enumerate(actions):
+        target_id = action.get("target_candidate_id")
+        target_index = id_to_index.get(str(target_id))
+        record = {"action_index": action_index, "action_type": action.get("action_type"),
+                  "target_candidate_id": target_id, "candidate_index": target_index,
+                  "reason": action.get("reason")}
+        if target_index is None:
+            record.update(status="rejected", rejection_reason="target_candidate_id_mismatch")
+            records.append(record)
+            continue
+        before = copy.deepcopy(mutated[target_index])
+        try:
+            expected = action.get("base_fingerprint")
+            if expected and expected != originals[target_index].candidate_fingerprint():
+                raise ValueError("base_fingerprint_mismatch")
+            if action["action_type"] == "mutation":
+                for change in action["changes"]:
+                    rf = mutated[target_index].round_functions[change["round_index"]]
+                    if change["component"] == "sbox":
+                        substitution = rf.substitution
+                        idx = change["sbox_index"]
+                        valid, constructed = _is_valid_mantis_sbox_payload(
+                            change.get("value"),
+                            change.get("input_permutation"),
+                            change.get("output_permutation"),
+                        )
+                        if not valid or constructed is None:
+                            raise ValueError("invalid_mantis_sbox_component")
+                        if not hasattr(substitution, "input_permutations"):
+                            substitution.input_permutations = [None] * len(substitution.sboxes)
+                        if not hasattr(substitution, "output_permutations"):
+                            substitution.output_permutations = [None] * len(substitution.sboxes)
+                        if len(substitution.input_permutations) != len(substitution.sboxes) or len(substitution.output_permutations) != len(substitution.sboxes):
+                            raise ValueError("sbox_permutation_metadata_length_mismatch")
+                        substitution.input_permutations[idx] = np.asarray(
+                            change["input_permutation"], dtype=int
+                        )
+                        substitution.output_permutations[idx] = np.asarray(
+                            change["output_permutation"], dtype=int
+                        )
+                        substitution.sboxes[idx] = constructed
+                    else:
+                        if rf.linear is None:
+                            raise ValueError("round_has_no_linear_layer")
+                        rf.linear.matrix = np.asarray(change["value"], dtype=int)
+            else:
+                child_rounds = action["child"]["rounds"]
+                if len(child_rounds) != len(mutated[target_index].round_functions):
+                    raise ValueError("child_round_count_mismatch")
+                new_rounds = []
+                for round_index, child_round in enumerate(child_rounds):
+                    if not isinstance(child_round, Mapping):
+                        raise ValueError("invalid_child_round")
+                    sboxes = child_round.get("sboxes")
+                    if not isinstance(sboxes, list) or len(sboxes) != 16:
+                        raise ValueError("child_round_requires_16_sboxes")
+                    subst = _components.substitution_layer()
+                    for sbox in sboxes:
+                        if not isinstance(sbox, Mapping):
+                            raise ValueError("child_sboxes_must_include_B_and_D")
+                        valid, constructed = _is_valid_mantis_sbox_payload(
+                            sbox.get("value"),
+                            sbox.get("input_permutation"),
+                            sbox.get("output_permutation"),
+                        )
+                        if not valid or constructed is None:
+                            raise ValueError("child_contains_invalid_mantis_sbox")
+                        subst.add_sbox(
+                            constructed,
+                            input_permutation=np.asarray(sbox["input_permutation"], dtype=int),
+                            output_permutation=np.asarray(sbox["output_permutation"], dtype=int),
+                        )
+                    rf = _components.round_function()
+                    rf.add_substitution_layer(subst)
+                    matrix = child_round.get("linear_matrix")
+                    if round_index == len(child_rounds) - 1:
+                        matrix = None
+                    if matrix is not None:
+                        if not _linear_functions.is_valid_linear_matrix(matrix, row_column_weight=3):
+                            raise ValueError("child_contains_invalid_linear_matrix")
+                        linear = _components.linear_layer()
+                        linear.matrix = np.asarray(matrix, dtype=int)
+                        rf.add_linear_layer(linear)
+                    else:
+                        rf.linear = None
+                    new_rounds.append(rf)
+                mutated[target_index].round_functions = new_rounds
+                mutated[target_index].num_rounds = len(new_rounds)
+            issues = _local_structure_issues(mutated[target_index])
+            if issues:
+                raise ValueError("structural_validation_failed")
+            record.update(status="accepted", before_fingerprint=before.candidate_fingerprint(),
+                          after_fingerprint=mutated[target_index].candidate_fingerprint())
+        except Exception as exc:
+            mutated[target_index] = before
+            record.update(status="rejected", rejection_reason=str(exc),
+                          after_fingerprint=mutated[target_index].candidate_fingerprint())
+        records.append(record)
+    return mutated, records
+
+
+def _parse_action_plan(
+    payload: Mapping[str, Any],
+    *,
+    request_id: str,
+    candidate_bindings: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
+    expected_generation: Any = None,
+    max_actions: int = DEFAULT_MAX_TOTAL_OPERATIONS,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Optional[str]]:
+    """Parse the decision-only protocol exposed to the language model."""
+    if not isinstance(payload, Mapping):
+        raise MutationSchemaError("action plan must be a JSON object")
+    allowed_root = {"schema_version", "request_id", "generation", "actions"}
+    unknown = set(payload) - allowed_root
+    if unknown:
+        raise MutationSchemaError("unknown action-plan fields: " + ", ".join(sorted(map(str, unknown))))
+    if payload.get("schema_version") != MUTATION_SCHEMA_VERSION:
+        raise MutationSchemaError("unsupported action-plan schema version")
+    if payload.get("request_id") != request_id:
+        raise MutationSchemaError("action-plan request_id does not match the request")
+    generation = payload.get("generation")
+    if generation is not None and not _is_int(generation):
+        raise MutationSchemaError("generation must be an integer or null")
+    # Generation is informational metadata. A model may describe the target as
+    # the next generation, so do not reject an otherwise valid action plan only
+    # because this echo field differs from the request.
+    actions = payload.get("actions")
+    if not isinstance(actions, list) or len(actions) > int(max_actions):
+        raise MutationSchemaError("actions must be an array within the configured limit")
+    bindings = _binding_entries(candidate_bindings)
+    bound_ids = {str(item.get("candidate_id")): int(item.get("candidate_index")) for item in bindings}
+    parsed: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for index, raw in enumerate(actions):
+        try:
+            if not isinstance(raw, Mapping):
+                raise MutationSchemaError("action must be an object")
+            if set(raw) - _ACTION_KEYS:
+                raise MutationSchemaError("unknown action fields")
+            action_type = raw.get("action_type")
+            target_id = raw.get("target_candidate_id")
+            if action_type not in {"mutation", "crossover"}:
+                raise MutationSchemaError("action_type must be mutation or crossover")
+            if not isinstance(target_id, str) or target_id not in bound_ids:
+                raise MutationSchemaError("target_candidate_id is not bound to a candidate")
+            result = {
+                "action_type": action_type,
+                "target_candidate_id": target_id,
+                "candidate_index": bound_ids[target_id],
+                "base_fingerprint": raw.get("base_fingerprint"),
+            }
+            if result["base_fingerprint"] is not None and not isinstance(result["base_fingerprint"], str):
+                raise MutationSchemaError("base_fingerprint must be a string or null")
+            if action_type == "mutation":
+                round_index = raw.get("round_index")
+                component = raw.get("component")
+                matrix = raw.get("transformation_matrix")
+                if not _is_int(round_index) or int(round_index) < 0:
+                    raise MutationSchemaError("round_index must be a non-negative integer")
+                if component not in {"sbox_B", "sbox_D", "linear"}:
+                    raise MutationSchemaError("component must be sbox_B, sbox_D, or linear")
+                if component.startswith("sbox_"):
+                    sbox_index = raw.get("sbox_index")
+                    if not _is_int(sbox_index) or not 0 <= int(sbox_index) < 16:
+                        raise MutationSchemaError("sbox_index must be in 0..15")
+                    if not _sbox_functions.is_bit_permutation_matrix(matrix):
+                        raise MutationSchemaError("S-box transformation_matrix must be a 4x4 permutation matrix")
+                    result["sbox_index"] = int(sbox_index)
+                elif not _linear_functions.is_valid_permutation_matrix(matrix, 64):
+                    raise MutationSchemaError("linear transformation_matrix must be a 64x64 permutation matrix")
+                result.update(round_index=int(round_index), component=component,
+                              transformation_matrix=to_builtin(matrix))
+            else:
+                parents = raw.get("parent_candidate_ids")
+                if not isinstance(parents, list) or len(parents) != 2:
+                    raise MutationSchemaError("crossover requires exactly two parent_candidate_ids")
+                if parents[0] == parents[1] or any(not isinstance(item, str) or item not in bound_ids for item in parents):
+                    raise MutationSchemaError("crossover parent ids must be two distinct bound candidates")
+                start = raw.get("start_component")
+                if not isinstance(start, Mapping):
+                    raise MutationSchemaError("crossover requires start_component")
+                if set(start) - {"round_index", "component", "sbox_index"}:
+                    raise MutationSchemaError("unknown start_component fields")
+                start_round = start.get("round_index")
+                start_kind = start.get("component")
+                if not _is_int(start_round) or int(start_round) < 0 or start_kind not in {"sbox", "linear"}:
+                    raise MutationSchemaError("start_component is malformed")
+                normalized_start = {"round_index": int(start_round), "component": start_kind}
+                if start_kind == "sbox":
+                    start_sbox = start.get("sbox_index")
+                    if not _is_int(start_sbox) or not 0 <= int(start_sbox) < 16:
+                        raise MutationSchemaError("start_component.sbox_index must be in 0..15")
+                    normalized_start["sbox_index"] = int(start_sbox)
+                result.update(parent_candidate_ids=list(parents), start_component=normalized_start)
+            parsed.append(result)
+        except MutationSchemaError as exc:
+            rejected.append({"action_index": index, "status": "rejected",
+                             "rejection_reason": "schema_validation_failed",
+                             "error_detail": _safe_error_text(exc), "action": to_builtin(raw)})
+    return parsed, rejected, None
+
+
+def apply_action_plan(
+    members: Sequence[Any],
+    actions: Sequence[Mapping[str, Any]],
+    engineering_validator: Optional[Any] = None,
+    generation_context: Optional[Mapping[str, Any]] = None,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Apply decision-only actions and materialize the next candidates locally."""
+    del engineering_validator, generation_context
+    originals = [copy.deepcopy(member) for member in members]
+    mutated = [copy.deepcopy(member) for member in members]
+    id_to_index = {
+        str(item.get("candidate_id")): int(item.get("candidate_index"))
+        for item in _binding_entries(_candidate_bindings(originals))
+    }
+    records: list[dict[str, Any]] = []
+
+    def _replace_sbox(target: Any, change: Mapping[str, Any]) -> None:
+        rf = target.round_functions[int(change["round_index"])]
+        substitution = rf.substitution
+        index = int(change["sbox_index"])
+        if not hasattr(substitution, "input_permutations") or not hasattr(substitution, "output_permutations"):
+            raise ValueError("sbox_requires_B_and_D_metadata")
+        B = np.asarray(substitution.input_permutations[index], dtype=int)
+        D = np.asarray(substitution.output_permutations[index], dtype=int)
+        T = np.asarray(change["transformation_matrix"], dtype=int)
+        if not _sbox_functions.is_bit_permutation_matrix(B) or not _sbox_functions.is_bit_permutation_matrix(D):
+            raise ValueError("existing_sbox_B_or_D_is_invalid")
+        if change["component"] == "sbox_B":
+            B = (T.dot(B)) % 2
+        else:
+            D = (D.dot(T)) % 2
+        if not _sbox_functions.is_bit_permutation_matrix(B) or not _sbox_functions.is_bit_permutation_matrix(D):
+            raise ValueError("transformation_does_not_preserve_sbox_permutation")
+        substitution.input_permutations[index] = B
+        substitution.output_permutations[index] = D
+        substitution.sboxes[index] = _sbox_functions.construct_mantis_sbox(B, D)
+
+    def _splice(target: Any, parent_a: Any, parent_b: Any, start: Mapping[str, Any]) -> None:
+        rounds_a = parent_a.round_functions
+        rounds_b = parent_b.round_functions
+        if len(rounds_a) != len(rounds_b):
+            raise ValueError("crossover_round_count_mismatch")
+        round_index = int(start["round_index"])
+        if not 0 <= round_index < len(rounds_a):
+            raise ValueError("crossover_round_index_out_of_range")
+        start_kind = start["component"]
+        start_sbox = int(start.get("sbox_index", 0)) if start_kind == "sbox" else 16
+        for r_index in range(round_index, len(rounds_a)):
+            first_sbox = start_sbox if r_index == round_index else 0
+            for sbox_index in range(first_sbox, 16):
+                src = rounds_b[r_index].substitution
+                dst = target.round_functions[r_index].substitution
+                dst.sboxes[sbox_index] = copy.deepcopy(src.sboxes[sbox_index])
+                dst.input_permutations[sbox_index] = copy.deepcopy(src.input_permutations[sbox_index])
+                dst.output_permutations[sbox_index] = copy.deepcopy(src.output_permutations[sbox_index])
+            if r_index > round_index or start_kind in {"linear", "sbox"}:
+                target.round_functions[r_index].linear = copy.deepcopy(rounds_b[r_index].linear)
+        target.round_functions[-1].linear = None
+
+    for action_index, action in enumerate(actions):
+        target_index = id_to_index.get(str(action.get("target_candidate_id")))
+        record = {
+            "action_index": action_index,
+            "action_type": action.get("action_type"),
+            "target_candidate_id": action.get("target_candidate_id"),
+            "candidate_index": target_index,
+        }
+        try:
+            if target_index is None:
+                raise ValueError("target_candidate_id_mismatch")
+            target = mutated[target_index]
+            expected = action.get("base_fingerprint")
+            if expected and expected != originals[target_index].candidate_fingerprint():
+                raise ValueError("base_fingerprint_mismatch")
+            if action["action_type"] == "mutation":
+                if str(action["component"]).startswith("sbox_"):
+                    _replace_sbox(target, action)
+                else:
+                    round_function = target.round_functions[int(action["round_index"])]
+                    if round_function.linear is None:
+                        raise ValueError("round_has_no_linear_layer")
+                    matrix = np.asarray(round_function.linear.matrix, dtype=int)
+                    transformed = (
+                        np.asarray(action["transformation_matrix"], dtype=int).dot(matrix)
+                    ) % 2
+                    if not _linear_functions.is_valid_linear_matrix(
+                        transformed, row_column_weight=3
+                    ):
+                        raise ValueError("transformation_does_not_preserve_linear_properties")
+                    round_function.linear.matrix = transformed
+            else:
+                parent_ids = action["parent_candidate_ids"]
+                parent_a = originals[id_to_index[parent_ids[0]]]
+                parent_b = originals[id_to_index[parent_ids[1]]]
+                _splice(target, parent_a, parent_b, action["start_component"])
+            issues = _local_structure_issues(target)
+            if issues:
+                raise ValueError("structural_validation_failed")
+            record["status"] = "accepted"
+        except Exception as exc:
+            mutated[target_index] = originals[target_index] if target_index is not None else mutated[target_index]
+            record.update(status="rejected", rejection_reason=str(exc))
+        records.append(record)
     return mutated, records
 
 
@@ -1288,6 +1880,43 @@ def _local_structure_issues(candidate: Any) -> list[dict[str, Any]]:
                         }
                     )
 
+            input_permutations = getattr(substitution, "input_permutations", None)
+            output_permutations = getattr(substitution, "output_permutations", None)
+            # Legacy non-MANTIS candidates may have no B/D metadata at all. If
+            # metadata is present, however, it is part of the component
+            # contract and every position must carry two legal permutations
+            # whose construction reproduces the stored S-box exactly.
+            metadata_present = input_permutations is not None or output_permutations is not None
+            if metadata_present:
+                if not isinstance(input_permutations, (list, tuple)) or not isinstance(
+                    output_permutations, (list, tuple)
+                ) or len(input_permutations) != 16 or len(output_permutations) != 16:
+                    issues.append(
+                        {
+                            "code": "sbox_permutation_metadata_count",
+                            "message": f"round {round_index} must contain 16 input and 16 output bit permutations",
+                        }
+                    )
+                else:
+                    for sbox_index, table in enumerate(sboxes):
+                        input_permutation = input_permutations[sbox_index]
+                        output_permutation = output_permutations[sbox_index]
+                        if input_permutation is None and output_permutation is None:
+                            continue
+                        valid, constructed = _is_valid_mantis_sbox_payload(
+                            table, input_permutation, output_permutation
+                        )
+                        if not valid or constructed is None:
+                            issues.append(
+                                {
+                                    "code": "sbox_permutation_metadata",
+                                    "message": (
+                                        f"round {round_index} S-box {sbox_index} must have legal 4x4 B/D "
+                                        "and satisfy D o S_MANTIS o B"
+                                    ),
+                                }
+                            )
+
         linear = getattr(round_function, "linear", None)
         matrix = getattr(linear, "matrix", None) if linear is not None else None
         is_last = round_index == len(rounds) - 1
@@ -1432,18 +2061,37 @@ def _candidate_prompt_payload(candidate: Any, index: int) -> dict[str, Any]:
     for round_index, round_function in enumerate(getattr(candidate, "round_functions", [])):
         substitution = getattr(round_function, "substitution", None)
         sboxes = getattr(substitution, "sboxes", [])
+        input_permutations = getattr(substitution, "input_permutations", [None] * len(sboxes))
+        output_permutations = getattr(substitution, "output_permutations", [None] * len(sboxes))
+        sbox_components = [
+            {
+                "value": to_builtin(sboxes[sbox_index]),
+                "input_permutation": to_builtin(input_permutations[sbox_index])
+                if sbox_index < len(input_permutations)
+                else None,
+                "output_permutation": to_builtin(output_permutations[sbox_index])
+                if sbox_index < len(output_permutations)
+                else None,
+            }
+            for sbox_index in range(len(sboxes))
+        ]
         linear = getattr(round_function, "linear", None)
         matrix = getattr(linear, "matrix", None) if linear is not None else None
         rounds_payload.append(
             {
                 "round_index": round_index,
                 "sboxes": to_builtin(sboxes),
+                "sbox_components": sbox_components,
+                "sbox_input_permutations": to_builtin(input_permutations),
+                "sbox_output_permutations": to_builtin(output_permutations),
                 "linear_rows_hex": _matrix_rows_hex(matrix) if matrix is not None else None,
+                "linear_matrix": to_builtin(matrix) if matrix is not None else None,
             }
         )
     return {
         "candidate_index": index,
         "candidate_id": candidate_id,
+        "score": _prompt_score(candidate),
         "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "metrics": _member_metrics(candidate),
@@ -1461,9 +2109,30 @@ def _local_candidate_payload(
     for round_function in getattr(candidate, "round_functions", []):
         substitution = getattr(round_function, "substitution", None)
         linear = getattr(round_function, "linear", None)
+        sboxes = getattr(substitution, "sboxes", [])
+        input_permutations = getattr(substitution, "input_permutations", [None] * len(sboxes))
+        output_permutations = getattr(substitution, "output_permutations", [None] * len(sboxes))
         rounds.append(
             {
-                "sboxes": to_builtin(getattr(substitution, "sboxes", [])),
+                "sboxes": to_builtin(sboxes),
+                "sbox_components": [
+                    {
+                        "value": to_builtin(sboxes[index]),
+                        "input_permutation": to_builtin(input_permutations[index])
+                        if index < len(input_permutations)
+                        else None,
+                        "output_permutation": to_builtin(output_permutations[index])
+                        if index < len(output_permutations)
+                        else None,
+                    }
+                    for index in range(len(sboxes))
+                ],
+                "sbox_input_permutations": to_builtin(
+                    input_permutations
+                ),
+                "sbox_output_permutations": to_builtin(
+                    output_permutations
+                ),
                 "linear_matrix": to_builtin(getattr(linear, "matrix", None))
                 if linear is not None
                 else None,
@@ -1480,31 +2149,21 @@ def _local_candidate_payload(
 
 def _system_prompt(settings: DeepSeekSettings) -> str:
     return (
-        "You are the mutation planner for an SPN block-cipher genetic search. "
-        "Analyze the whole generation and return exactly one JSON object, with no markdown or prose outside JSON. "
-        f"The root schema is {{\"schema_version\":\"{MUTATION_SCHEMA_VERSION}\","
-        "\"request_id\":<copy input request_id>,\"generation\":<input generation>,"
-        "\"plans\":[{{\"target_candidate_id\":<id>,\"base_fingerprint\":<fingerprint>,"
-        "\"operations\":[...]}}],\"rationale\":<string or null>}. "
-        "Each plan targets one crossover child using its exact target_candidate_id and base_fingerprint. "
-        "Each operation must contain round_index, component, operation, params, reason; candidate_index is optional inside plans. "
-        "Allowed operations and exact params are: "
-        "swap_sbox_entries/sbox {sbox_index,entry_a,entry_b}; "
-        "replace_sbox/sbox {sbox_index,table}, where table is a permutation of 0..15; "
-        "sbox_swap_entries/sbox {sbox_index,entry_a,entry_b}; "
-        "sbox_replace or sbox_affine/sbox {sbox_index,table}; "
-        "swap_sbox_positions/sbox {sbox_a,sbox_b}; "
-        "swap_linear_rows/linear {row_a,row_b}; "
-        "swap_linear_columns/linear {column_a,column_b}; "
-        "copy_component/copy_component {source_candidate_index or source_candidate_id, source_round_index, source_component=sbox|linear}; "
-        "copy_round {source_candidate_index or source_candidate_id, source_round_index}. "
-        "Indices are zero-based. Do not target a final round with a linear operation. "
-        f"Return at most {settings.max_total_operations} total operations and at most "
-        f"{settings.max_operations_per_candidate} operations per candidate. "
-        "The user payload may include generation_attempt and validation_feedback from a prior attempt; "
-        "when present, correct every listed issue before returning the next plan. "
-        "Use the supplied security, validation, performance, diversity and population state when present. "
-        "An empty operations array is valid when no defensible mutation exists."
+        "You are the structural decision maker for an SPN block-cipher search. "
+        "Analyze every candidate and its score from the input. Return exactly one JSON object and no markdown. "
+        f"The only output schema is {{\"schema_version\":\"{MUTATION_SCHEMA_VERSION}\","
+        "\"request_id\":<copy input request_id>,\"generation\":<copy input generation exactly>,\"actions\":[...]}. "
+        "Do not output rationale, reason, operators, methods, or materialized child components. "
+        "For a mutation, output exactly one target candidate, one round_index, one component, and one "
+        "transformation_matrix. Use component sbox_B or sbox_D with sbox_index and a legal 4x4 binary "
+        "permutation matrix, or component linear with a legal 64x64 binary permutation matrix. "
+        "The framework applies the matrix and rejects any result that is not structurally valid. "
+        "For a crossover, output exactly two distinct parent_candidate_ids and start_component containing "
+        "round_index and component sbox or linear, plus sbox_index when component is sbox. Do not output the child. "
+        "All resulting S-boxes must remain bijections on 0..15 and use the fixed MANTIS S-box with legal B/D "
+        "permutations. Every non-final linear layer must be 64x64 binary, have exactly three 1s in every row and "
+        "column, and be invertible and orthogonal over GF(2); the final round has no linear layer. "
+        f"Return at most {settings.max_total_operations} actions. An empty actions array is valid."
     )
 
 
@@ -1794,6 +2453,16 @@ def _member_metrics(member: Any) -> dict[str, Any]:
         "mutation_changes",
     )
     return {field: to_builtin(getattr(member, field, None)) for field in fields}
+
+
+def _prompt_score(member: Any) -> float:
+    """Return a stable numeric score for the LLM prompt (0.0 when unset)."""
+    value = getattr(member, "fitness", None)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if np.isfinite(value) else 0.0
 
 
 def _candidate_bindings(members: Sequence[Any]) -> dict[str, Any]:

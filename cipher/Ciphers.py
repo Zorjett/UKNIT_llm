@@ -1112,82 +1112,37 @@ class Generation:
         return last_mutation, attempts
 
     def breeding(self, advisor=None, generation_context=None, engineering_validator=None):
-        """Create crossover children, enforce uniqueness, then call the advisor.
+        """Prepare candidate slots and let the advisor choose crossover/mutation.
 
-        Each child first receives the configured child-level random component
-        mutation (5% normally, forced to 100% for duplicates).  The optional
-        advisor then applies its separately validated mutation plan.
+        The framework does not apply a local crossover or mutation after this
+        point.  Duplicate slots are reported to the advisor, which must resolve
+        them with a validated action plan.
         """
-        self.next_members = []
-        self.last_breeding_records = []
+        # Crossover and mutation are delegated to the LLM.  Start from a deep
+        # copy of the current population so an unavailable/invalid advisor is
+        # a no-op and never mutates evaluated candidates in place.
         target_size = max(0, int(config.HYPERPARAMETERS['POPULATION_SIZE']))
-        parents_pool = list(getattr(self, 'breeding_population', []) or [])
-        if target_size and not parents_pool:
-            parents_pool = list(self.members)
-        if target_size and len(parents_pool) == 1:
-            parents_pool = parents_pool * 2
-
-        while len(self.next_members) < target_size and parents_pool:
-            if len(parents_pool) >= 2:
-                parents = np.random.choice(parents_pool, 2, replace=False)
-                parent_a, parent_b = parents[0], parents[1]
-            else:
-                parent_a = parent_b = parents_pool[0]
-            child1, child2 = parent_a.breed(parent_b)
-            children = (child1, child2)
-            for child in children:
-                if len(self.next_members) >= target_size:
-                    break
-                child_index = len(self.next_members)
-                child.pop_index = child_index
-                child.gen_index = self.gen_index
-                child.candidate_id = 'r%02d-g%04d-child-%04d' % (
-                    self.num_rounds, self.gen_index, child_index
-                )
-                existing = list(self.members) + list(self.fittest_population)
-                duplicate = self.ismember(child, existing + self.next_members)
-                mutation_probability = 1.0 if duplicate else float(
-                    config.GENETIC_ALGO['MUTATION_PROB']
-                )
-                mutation = child.mutate(prob=mutation_probability)
-                forced_attempts = 1 if duplicate and mutation is not None else 0
-                # A probabilistic mutation can theoretically land on another
-                # existing candidate.  Re-check the concrete cipher and keep
-                # forcing mutations until this child is unique.
-                forbidden = existing + self.next_members
-                if self.ismember(child, forbidden):
-                    duplicate = True
-                    mutation_probability = 1.0
-                    extra_mutation, extra_attempts = self._force_unique_mutation(
-                        child, forbidden
-                    )
-                    mutation = extra_mutation
-                    forced_attempts += extra_attempts
-                if mutation is not None:
-                    child.mutation_changes.append({
-                        'operation': 'random_component_mutation',
-                        'candidate_index': child_index,
-                        'forced': bool(duplicate),
-                        'probability': mutation_probability,
-                        'attempts': int(max(1, forced_attempts)) if duplicate else 1,
-                        'details': deepcopy(mutation),
-                    })
-                self.next_members.append(child)
-                self.last_breeding_records.append({
-                    'type': 'crossover',
-                    'child_index': child_index,
-                    'child_id': child.candidate_id,
-                    'parent_ids': list(getattr(child, 'parent_ids', [])),
-                    'strategy': getattr(child, 'crossover_strategy', None),
-                    'duplicate_before_llm': bool(duplicate),
-                    'mutation_applied': mutation is not None,
-                    'mutation_forced': bool(duplicate),
-                    'mutation_probability': mutation_probability,
-                    'forced_mutation_attempts': int(forced_attempts),
-                    'status': 'created',
-                })
-
-        self.next_members = self.next_members[:target_size]
+        self.next_members = [deepcopy(member) for member in self.members[:target_size]]
+        self.last_breeding_records = [
+            {
+                'type': 'llm_candidate_pool',
+                'child_index': index,
+                'child_id': _stable_member_id(member),
+                'parent_ids': [],
+                'strategy': 'llm_decides',
+                'status': 'pending',
+            }
+            for index, member in enumerate(self.next_members)
+        ]
+        # The LLM must decide how to resolve collisions.  Mark copied slots
+        # that already equal an existing candidate so the prompt can request a
+        # mutation/crossover instead of silently accepting duplicates.
+        for index, child in enumerate(self.next_members):
+            duplicate = self.ismember(child, self.members + self.fittest_population)
+            self.last_breeding_records[index].update(
+                duplicate_before_llm=bool(duplicate),
+                duplicate_requires_llm_action=bool(duplicate),
+            )
         if advisor is None:
             from llm_mutation import DeepSeekMutationAdvisor
             advisor = DeepSeekMutationAdvisor()
@@ -1255,33 +1210,19 @@ class Generation:
             raise
         self.next_members = list(mutated_members)
         self.last_mutation_report = mutation_report or {}
-        # Keep the final post-advisor population unique as well.  The advisor
-        # works on children only and may legitimately return an unchanged or
-        # newly-colliding candidate.
-        unique_children = []
+        # Do not mutate duplicates locally: all crossover and mutation choices
+        # belong to the LLM.  Record collisions so the next prompt can request
+        # a deliberate mutation/crossover with the required structural checks.
         existing = list(self.members) + list(self.fittest_population)
+        seen = list(existing)
         for child_index, child in enumerate(self.next_members):
-            forbidden = existing + unique_children
-            if self.ismember(child, forbidden):
-                mutation, attempts = self._force_unique_mutation(child, forbidden)
-                child.mutation_changes.append({
-                    'operation': 'random_component_mutation',
+            duplicate = self.ismember(child, seen)
+            if duplicate:
+                self.last_mutation_report.setdefault('warnings', []).append({
                     'candidate_index': child_index,
-                    'forced': True,
-                    'probability': 1.0,
-                    'attempts': int(attempts),
-                    'details': deepcopy(mutation),
-                    'reason': 'post_advisor_duplicate',
+                    'reason': 'post_advisor_duplicate_requires_llm_action',
                 })
-                if child_index < len(self.last_breeding_records):
-                    self.last_breeding_records[child_index].update(
-                        mutation_forced=True,
-                        mutation_probability=1.0,
-                        post_advisor_duplicate=True,
-                        forced_mutation_attempts=int(attempts),
-                    )
-            unique_children.append(child)
-        self.next_members = unique_children
+            seen.append(child)
         for record in self.last_mutation_report.get('change_records', []):
             index = record.get('candidate_index')
             if isinstance(index, int) and 0 <= index < len(self.next_members):
@@ -1455,54 +1396,31 @@ class Generation:
             self.breeding_population = []
             self.gen_index = 0
             
+            # Round growth is deliberately independent of crossover/LLM choice:
+            # every candidate receives one freshly randomized linear layer and
+            # one freshly randomized S-box layer.  The old final round gains the
+            # new inter-round linear layer; the appended round is final and thus
+            # has no following linear layer.
             members = deepcopy(self.members)
-            source_ids = [_stable_member_id(member) for member in members]
+            tmp_members = []
+            for member in members:
+                if not member.round_functions:
+                    member.randomize(self.num_rounds)
+                previous_final = member.round_functions[-1]
+                new_linear = components.linear_layer()
+                new_linear.randomize()
+                previous_final.linear = new_linear
 
-            choices = np.random.choice(list(config.GENETIC_ALGO['ADD_ONE_ROUND'].keys()),size=len(members),replace=True,
-                                            p=list(config.GENETIC_ALGO['ADD_ONE_ROUND'].values()))
+                new_round = components.round_function()
+                new_round.randomize()
+                new_round.linear = None
+                member.add_round_function(new_round)
+                tmp_members.append(member)
 
-            # The legacy STEAL operator consumes SAT-derived differential and
-            # linear trails.  Plugin mode may run before Team B/C are available,
-            # so those fields are intentionally empty.  Downgrade only the
-            # affected choices to the existing RANDOM expansion; legacy mode and
-            # valid trail-backed STEAL behavior remain unchanged.
-            effective_choices = choices.copy()
-            round_growth_fallbacks = []
-            evaluation_mode = getattr(config, 'FRAMEWORK', {}).get('EVALUATION_MODE', 'legacy')
-            if evaluation_mode == 'plugins':
-                for index, member in enumerate(members):
-                    if choices[index] != 'STEAL':
-                        continue
-                    if not self._can_steal_one_round(member, members):
-                        effective_choices[index] = 'RANDOM'
-                        round_growth_fallbacks.append({
-                            'member_index': int(index),
-                            'member_id': getattr(member, 'candidate_id', None),
-                            'requested': 'STEAL',
-                            'effective': 'RANDOM',
-                            'reason': 'missing_diff_or_linear_trails',
-                        })
             self.last_round_growth_report = {
-                'evaluation_mode': evaluation_mode,
-                'requested_choices': choices.tolist(),
-                'effective_choices': effective_choices.tolist(),
-                'fallbacks': round_growth_fallbacks,
+                'strategy': 'random_sbox_and_linear',
+                'member_count': len(tmp_members),
             }
-
-            # Submit one task per member and collect futures in the same order.
-            # The previous grouped STEAL/RANDOM collection silently reordered the
-            # population, which broke the requested/effective choice mapping.
-            with ProcessPoolExecutor(max_workers=max_threads) as executor:
-                futures = []
-                for index, member in enumerate(members):
-                    if effective_choices[index] == 'STEAL':
-                        future = executor.submit(
-                            utils.call_steal_one_round, member, members
-                        )
-                    else:
-                        future = executor.submit(utils.smart_randomize_one_round, member)
-                    futures.append(future)
-                tmp_members = [future.result() for future in futures]
 
             round_growth_members = []
 
@@ -1518,10 +1436,10 @@ class Generation:
                 )
                 round_growth_members.append({
                     'member_index': int(i),
-                    'source_member_id': source_ids[i] if i < len(source_ids) else None,
+                    'source_member_id': _stable_member_id(self.members[i]) if i < len(self.members) else None,
                     'member_id': member.candidate_id,
-                    'requested': str(choices[i]),
-                    'effective': str(effective_choices[i]),
+                    'requested': 'RANDOM_SBOX_AND_LINEAR',
+                    'effective': 'RANDOM_SBOX_AND_LINEAR',
                     'status': 'applied',
                 })
 

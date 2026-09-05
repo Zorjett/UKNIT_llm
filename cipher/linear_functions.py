@@ -367,8 +367,10 @@ class linear_functions:
         result = linear_functions.get_aes_shiftrows().dot(mat)
         if not linear_functions._is_regular_binary_matrix(result, 64, 3):
             raise ValueError('ShiftRows must preserve three 1s per row and column')
-        if not linear_functions.is_invertible(result):
-            raise ValueError('final diffusion matrix is singular')
+        if not linear_functions.is_valid_linear_matrix(result, row_column_weight=3):
+            raise ValueError(
+                'final diffusion matrix must be invertible and orthogonal over GF(2)'
+            )
         return result
 
     @staticmethod

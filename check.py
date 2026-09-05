@@ -6,7 +6,7 @@ from team_plugins.plugin_contracts import candidate_to_dict
 
 
 run_dir = Path(
-    r"D:\xinxijishujingsai\架构\uknit-constructions\runs\RUN_2026-09-04_19-47-31-917460"
+    r"D:\xinxijishujingsai\架构\uknit-constructions\runs\RUN_2026-09-05_11-43-35-813819"
 )
 
 generation = pickle_load(str(run_dir / "gen_5_4.pkl"))
