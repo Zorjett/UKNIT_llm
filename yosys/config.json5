@@ -1,0 +1,47 @@
+/*
+Note that these configurations have been adapted from the OpenLane repository. 
+*/
+
+/* Copyright 2020-2023 Efabless Corporation
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+
+
+{
+    "SYNTH_DRIVING_CELL": "sky130_fd_sc_hd__inv_2/Y", // The cell to drive the input ports, used in synthesis and static timing analysis
+    "SYNTH_DIRECT_WIRE_BUFFERING": true, // Enables inserting buffer cells for directly connected wires
+    "SYNTH_BUFFER_CELL": "sky130_fd_sc_hd__buf_2/A/X", // does not affect delay/area 
+    "SYNTH_TIEHI_CELL": "sky130_fd_sc_hd__conb_1/HI", // does not affect delay/area
+    "SYNTH_TIELO_CELL": "sky130_fd_sc_hd__conb_1/LO", // does not affect delay/area
+    "OUTPUT_CAP_LOAD" : 33.442, // default capacitance load 
+    
+    "MAX_TRANSITION_CONSTRAINT": 0.75, // default for openlane
+    "MAX_FANOUT_CONSTRAINT": 10, // default fanout for openlane
+    
+    "SYNTH_LIBS": ["sky130_fd_sc_hd__tt_025C_1v80_removed_no_synth.lib"],
+
+    "SYNTH_ABC_AREA_USE_NF": false, // Use non-finite (NF) area optimization, aggressive area optimization
+    "SYNTH_ABC_BUFFERING": false, // Enables `abc` cell buffering.
+    "SYNTH_ABC_USE_MFS3": false, // Enables ABC's MFS3 optimization script (SAT-based resynthesis)
+    "SYNTH_SIZING": false, // Enable `abc` cell sizing (instead of buffering).",
+    "SYNTH_STRATEGY": "AREA 3", // `abc` strategy
+
+    "VERILOG_INCLUDE_DIRS": null, // include any flags to be added for read_verilog command
+    "ABC_OUTPUT_FILE" : "abc.log",
+    "YOSYS_OUTPUT_FILE" : "yosys.log",
+    "SAVE_NETLIST" : "uknit_top.nl.v", // file containing the final netlist
+    "SYNTH_SPLITNETS": true, // for easier reading
+    "CLOCK_PERIOD": 10, // default clock period
+    
+}
