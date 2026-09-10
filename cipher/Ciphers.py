@@ -67,6 +67,29 @@ def _stable_member_id(member):
     return None
 
 
+def _member_llm_history(member, max_fingerprints=16, max_actions=8):
+    """Return compact novelty constraints inherited with one candidate."""
+    fingerprints = []
+    action_specs = []
+    for change in getattr(member, 'mutation_changes', []) or []:
+        if not isinstance(change, dict) or change.get('status') != 'accepted':
+            continue
+        for key in ('before_fingerprint', 'after_fingerprint'):
+            value = change.get(key)
+            if value and value not in fingerprints:
+                fingerprints.append(str(value))
+        action_spec = change.get('action_spec')
+        if isinstance(action_spec, dict) and action_spec not in action_specs:
+            action_specs.append(deepcopy(action_spec))
+    current = _safe_member_fingerprint(member)
+    if current and not str(current).startswith('error:') and current not in fingerprints:
+        fingerprints.append(current)
+    return {
+        'forbidden_fingerprints': fingerprints[-max_fingerprints:],
+        'recent_action_specs': action_specs[-max_actions:],
+    }
+
+
 def _reset_evaluation_state(member, status='pending', clear_mutation_changes=False):
     """Invalidate metrics after a structural change to a candidate."""
     for attribute in (
@@ -242,16 +265,38 @@ class Member:
             candidate = self.to_candidate_dict()
             security_result = evaluate_security(candidate, base_context)
             validation_result = validate_candidate(candidate, base_context)
-            try:
-                performance_result = evaluate_performance(candidate, base_context)
-            except Exception as exc:
-                # Any OpenLane infrastructure or parsing failure is fatal. It
-                # must never be converted into a neutral/placeholder fitness.
-                if isinstance(exc, OpenLaneLatencyError):
-                    raise
-                raise OpenLaneLatencyError(
-                    'OpenLane performance evaluation failed: %s' % exc
-                ) from exc
+            if bool(config.OPENLANE.get('ENABLED', True)):
+                try:
+                    performance_result = evaluate_performance(candidate, base_context)
+                except Exception as exc:
+                    # Any OpenLane infrastructure or parsing failure is fatal.
+                    # It must never be converted into a neutral/placeholder
+                    # fitness while real performance analysis is enabled.
+                    if isinstance(exc, OpenLaneLatencyError):
+                        raise
+                    raise OpenLaneLatencyError(
+                        'OpenLane performance evaluation failed: %s' % exc
+                    ) from exc
+            else:
+                # Keep the normal plugin contract shape while explicitly
+                # recording that OpenLane was disabled by configuration.
+                performance_result = {
+                    'schema_version': '1.0',
+                    'plugin_api_version': '1.0',
+                    'plugin_name': 'team-c-engineering-openlane',
+                    'candidate_id': candidate.get('candidate_id', 'unknown'),
+                    'status': 'ok',
+                    'valid': True,
+                    'warnings': ['OpenLane performance analysis is disabled by configuration.'],
+                    'errors': [],
+                    'artifacts': {},
+                    'metrics': {
+                        'latency': 1.0,
+                        'area': None,
+                        'energy': None,
+                        'units': {'latency': 'placeholder'},
+                    },
+                }
             self.plugin_security = security_result
             self.plugin_validation = validation_result
             self.plugin_performance = performance_result
@@ -826,7 +871,9 @@ class Generation:
         
 
     def select_fittest_population(self,num_fittest_population):
-        pool = self.fittest_population + self.members
+        # Python's sort is stable. Put current members first so an equal score
+        # never causes a structurally newer LLM result to lose to an old elite.
+        pool = self.members + self.fittest_population
         self.next_fittest_population = sorted(
             pool, key=lambda x: _as_float(getattr(x, 'fitness', None), -float('inf')), reverse=True
         )[:max(0, int(num_fittest_population))]
@@ -915,6 +962,11 @@ class Generation:
         context['required_action_children'] = [
             record['child_id'] for record in self.last_breeding_records
         ]
+        context['candidate_history'] = {
+            _stable_member_id(member): _member_llm_history(member)
+            for member in self.next_members
+            if _stable_member_id(member)
+        }
         try:
             if not hasattr(advisor, 'mutate_generation'):
                 raise TypeError(
@@ -1005,8 +1057,11 @@ class Generation:
         from team_plugins.plugin_contracts import to_builtin
         file = os.path.join(folder,'gen_%s_%s.pkl' % (self.num_rounds,self.gen_index))
         utils.pickle_dump(file,self)
+        # A summary describes the generation named in its filename.  Including
+        # the previous elite pool here made equal-fitness runs repeatedly save
+        # the old generation even after the LLM had changed the current member.
         members = sorted(
-            self.fittest_population + self.members,
+            self.members,
             key=lambda x: _as_float(getattr(x, 'fitness', None), -float('inf')),
             reverse=True,
         )[:config.HYPERPARAMETERS['POPULATION_SIZE']]
@@ -1095,7 +1150,7 @@ class Generation:
         # terminating condition
         if self.gen_index == config.HYPERPARAMETERS['MAX_GENERATION'][self.num_rounds] - 1 and self.num_rounds == config.HYPERPARAMETERS['MAX_NUM_ROUNDS']:
             self.members = sorted(
-                self.fittest_population + self.members,
+                self.members + self.fittest_population,
                 key=lambda x: _as_float(getattr(x, 'fitness', None), -float('inf')),
                 reverse=True,
             )[:config.HYPERPARAMETERS['POPULATION_SIZE']]
@@ -1124,7 +1179,7 @@ class Generation:
         else: # add one more round
             self.num_rounds += 1
             self.members = sorted(
-                self.fittest_population + self.members,
+                self.members + self.fittest_population,
                 key=lambda x: _as_float(getattr(x, 'fitness', None), -float('inf')),
                 reverse=True,
             )[:config.HYPERPARAMETERS['POPULATION_SIZE']]

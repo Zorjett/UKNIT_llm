@@ -9,6 +9,7 @@ legacy ProcessPoolExecutor evaluation remains pickle-safe.
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import sys
@@ -199,11 +200,27 @@ def run(
 
         generation.select_fittest_population(num_fittest)
         context = _generation_context(generation, run_id)
-        mutation_report = generation.breeding(
-            advisor=mutation_advisor,
-            generation_context=context,
-            engineering_validator=validator,
-        )
+        try:
+            mutation_report = generation.breeding(
+                advisor=mutation_advisor,
+                generation_context=context,
+                engineering_validator=validator,
+            )
+        except Exception as exc:
+            failure_report = getattr(exc, "report", None)
+            if isinstance(failure_report, dict):
+                from team_plugins.plugin_contracts import to_builtin
+
+                failure_path = folder / (
+                    "llm_failure_r%02d_g%04d.json"
+                    % (generation.num_rounds, generation.gen_index)
+                )
+                failure_path.write_text(
+                    json.dumps(to_builtin(failure_report), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                print("[llm] failure report saved: %s" % failure_path, flush=True)
+            raise
 
         changes = list(getattr(generation, "last_breeding_records", []))
         changes.extend(mutation_report.get("change_records", []))

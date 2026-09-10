@@ -120,11 +120,21 @@ _ACTION_KEYS = {
     "round_index",
     "component",
     "sbox_index",
+    "bit_permutation",
     "transformation_matrix",
     "row_swap",
     "column_swap",
     "start_component",
 }
+
+_SBOX_BIT_PERMUTATIONS = [
+    [0, 1, 3, 2], [0, 2, 1, 3], [0, 2, 3, 1], [0, 3, 1, 2],
+    [0, 3, 2, 1], [1, 0, 2, 3], [1, 0, 3, 2], [1, 2, 0, 3],
+    [1, 2, 3, 0], [1, 3, 0, 2], [1, 3, 2, 0], [2, 0, 1, 3],
+    [2, 0, 3, 1], [2, 1, 0, 3], [2, 1, 3, 0], [2, 3, 0, 1],
+    [2, 3, 1, 0], [3, 0, 1, 2], [3, 0, 2, 1], [3, 1, 0, 2],
+    [3, 1, 2, 0], [3, 2, 0, 1], [3, 2, 1, 0],
+]
 
 
 def _is_binary_matrix(value: Any) -> bool:
@@ -360,28 +370,34 @@ class DeepSeekMutationAdvisor:
                 "required_for_candidate_ids": required_children,
                 "exactly_one_action_per_candidate": True,
                 "reason": "every next-generation child slot requires a mutation or crossover action",
+                "allowed_sbox_bit_permutations": _SBOX_BIT_PERMUTATIONS,
             }
-            base_prompt_payload["required_action_specs"] = [
-                {
+            history_by_id = (generation_context or {}).get("candidate_history", {})
+            if not isinstance(history_by_id, Mapping):
+                history_by_id = {}
+            required_specs = []
+            for item in candidates:
+                if item.get("candidate_id") not in set(required_children):
+                    continue
+                candidate_id = item["candidate_id"]
+                history = history_by_id.get(candidate_id, {})
+                if not isinstance(history, Mapping):
+                    history = {}
+                spec = {
                     "target_candidate_id": item["candidate_id"],
                     "base_fingerprint": item["fingerprint"],
                     "allowed_round_indices": list(range(int(item.get("num_rounds", 0) or 0))),
-                    "recommended_action": {
-                        "action_type": "mutation",
-                        "component": "sbox_B",
-                        "round_index": 0,
-                        "sbox_index": 0,
-                        "transformation_matrix": [
-                            [0, 1, 0, 0],
-                            [1, 0, 0, 0],
-                            [0, 0, 1, 0],
-                            [0, 0, 0, 1],
-                        ],
-                    },
+                    "allowed_sbox_indices": list(range(16)),
+                    "allowed_mutation_components": ["sbox_B", "sbox_D", "linear"],
                 }
-                for item in candidates
-                if item.get("candidate_id") in set(required_children)
-            ]
+                forbidden = history.get("forbidden_fingerprints", [])
+                recent = history.get("recent_action_specs", [])
+                if isinstance(forbidden, Sequence) and not isinstance(forbidden, (str, bytes)):
+                    spec["forbidden_result_fingerprints"] = [str(value) for value in forbidden if value]
+                if isinstance(recent, Sequence) and not isinstance(recent, (str, bytes)):
+                    spec["recent_action_specs"] = to_builtin(list(recent))
+                required_specs.append(spec)
+            base_prompt_payload["required_action_specs"] = required_specs
 
         # A model can return a syntactically valid plan which still produces an
         # illegal component (for example a malformed copied round).  Validate
@@ -399,6 +415,17 @@ class DeepSeekMutationAdvisor:
 
             attempt_request_attempts = 0
             try:
+                print(
+                    "[llm] requesting actions: generation=%s attempt=%d/%d candidates=%d model=%s"
+                    % (
+                        (generation_context or {}).get("generation"),
+                        generation_attempt,
+                        max_attempts,
+                        len(members),
+                        self.settings.model,
+                    ),
+                    flush=True,
+                )
                 response = self._request_plan(prompt_payload)
                 attempt_request_attempts = max(1, self._last_request_attempts)
                 total_request_attempts += attempt_request_attempts
@@ -409,6 +436,20 @@ class DeepSeekMutationAdvisor:
                     expected_generation=(generation_context or {}).get("generation"),
                     max_actions=self.settings.max_actions,
                 )
+                print(
+                    "[llm] response received: actions=%d schema_rejections=%d"
+                    % (len(actions), len(schema_rejections)),
+                    flush=True,
+                )
+                for rejection in schema_rejections:
+                    print(
+                        "[llm] action rejected by schema: action=%s reason=%s"
+                        % (
+                            rejection.get("action_index"),
+                            rejection.get("error_detail", "unknown schema error"),
+                        ),
+                        flush=True,
+                    )
             except MutationSchemaError as exc:
                 if attempt_request_attempts == 0:
                     total_request_attempts += max(1, self._last_request_attempts)
@@ -495,14 +536,26 @@ class DeepSeekMutationAdvisor:
                     "duplicate_or_wrong_count": duplicate_targets,
                     "generation_attempt": generation_attempt,
                 }
-                validation_feedback = [issue]
+                schema_issues = [
+                    {
+                        "code": "model_action_schema_invalid",
+                        "message": rejection.get("error_detail") or "model action failed schema validation",
+                        "action_index": rejection.get("action_index"),
+                        "rejected_action": rejection.get("action"),
+                        "generation_attempt": generation_attempt,
+                    }
+                    for rejection in schema_rejections
+                ]
+                # Put the concrete field error first. Previously the model only
+                # saw "missing action" and repeated the same malformed action.
+                validation_feedback = schema_issues + [issue]
                 validation_history.append(
                     {
                         "generation_attempt": generation_attempt,
                         "status": "invalid",
                         "accepted_count": 0,
                         "rejected_count": len(schema_rejections),
-                        "issues": [issue],
+                        "issues": to_builtin(validation_feedback),
                         "response_generation": (
                             response.get("generation")
                             if isinstance(response, Mapping)
@@ -524,6 +577,51 @@ class DeepSeekMutationAdvisor:
                     None,
                 )
 
+            history_by_id = (generation_context or {}).get("candidate_history", {})
+            if not isinstance(history_by_id, Mapping):
+                history_by_id = {}
+            repeated_action_ids = []
+            for action in actions:
+                candidate_id = str(action.get("target_candidate_id"))
+                history = history_by_id.get(candidate_id, {})
+                recent_specs = history.get("recent_action_specs", []) if isinstance(history, Mapping) else []
+                recent_signatures = {
+                    _action_signature(spec)
+                    for spec in recent_specs
+                    if isinstance(spec, Mapping)
+                }
+                if _action_signature(action) in recent_signatures:
+                    repeated_action_ids.append(candidate_id)
+            if repeated_action_ids:
+                issue = {
+                    "code": "repeated_llm_action",
+                    "message": (
+                        "LLM repeated a recent mutation/crossover action for: "
+                        + ", ".join(sorted(set(repeated_action_ids)))
+                        + ". Change the component, round, S-box index, transformation, or crossover point."
+                    ),
+                    "candidate_ids": sorted(set(repeated_action_ids)),
+                    "generation_attempt": generation_attempt,
+                }
+                validation_feedback = [issue]
+                validation_history.append({
+                    "generation_attempt": generation_attempt,
+                    "status": "invalid",
+                    "accepted_count": 0,
+                    "rejected_count": len(actions) + len(schema_rejections),
+                    "issues": [issue],
+                    "response_generation": response.get("generation") if isinstance(response, Mapping) else None,
+                    "actions": to_builtin(actions),
+                    "change_records": to_builtin(schema_rejections),
+                    "rationale": rationale,
+                })
+                if generation_attempt < max_attempts:
+                    continue
+                return _raise_component_validation_error(
+                    originals, report, validation_history, validation_feedback,
+                    total_request_attempts, None,
+                )
+
             mutated, application_records = apply_action_plan(
                 members,
                 actions,
@@ -531,23 +629,40 @@ class DeepSeekMutationAdvisor:
                 generation_context=generation_context,
             )
             unchanged_required = []
+            historical_duplicates = []
             for candidate_index, member in enumerate(mutated):
                 candidate_id = _candidate_id(member, candidate_index)
                 if candidate_id not in required_ids:
                     continue
-                if member.candidate_fingerprint() == originals[candidate_index].candidate_fingerprint():
+                result_fingerprint = member.candidate_fingerprint()
+                if result_fingerprint == originals[candidate_index].candidate_fingerprint():
                     unchanged_required.append(candidate_id)
+                history = history_by_id.get(candidate_id, {})
+                forbidden = history.get("forbidden_fingerprints", []) if isinstance(history, Mapping) else []
+                if result_fingerprint in set(str(value) for value in forbidden if value):
+                    if candidate_id not in unchanged_required:
+                        historical_duplicates.append(candidate_id)
+            novelty_issues = []
             if unchanged_required:
-                issue = {
+                novelty_issues.append({
                     "code": "required_duplicate_action_no_effect",
-                    "message": (
-                        "LLM action did not change duplicate candidate(s): "
-                        + ", ".join(sorted(unchanged_required))
-                    ),
+                    "message": "LLM action did not change candidate(s): " + ", ".join(sorted(unchanged_required)),
                     "candidate_ids": sorted(unchanged_required),
                     "generation_attempt": generation_attempt,
-                }
-                validation_feedback = [issue]
+                })
+            if historical_duplicates:
+                novelty_issues.append({
+                    "code": "historical_fingerprint_recreated",
+                    "message": (
+                        "LLM action recreated a previously visited cipher for: "
+                        + ", ".join(sorted(historical_duplicates))
+                        + ". Choose a different structural action."
+                    ),
+                    "candidate_ids": sorted(historical_duplicates),
+                    "generation_attempt": generation_attempt,
+                })
+            if novelty_issues:
+                validation_feedback = novelty_issues
                 validation_history.append(
                     {
                         "generation_attempt": generation_attempt,
@@ -560,7 +675,7 @@ class DeepSeekMutationAdvisor:
                             record.get("status") == "rejected"
                             for record in application_records
                         ),
-                        "issues": [issue],
+                        "issues": to_builtin(novelty_issues),
                         "response_generation": (
                             response.get("generation")
                             if isinstance(response, Mapping)
@@ -643,6 +758,11 @@ class DeepSeekMutationAdvisor:
             report["status"] = "applied" if accepted else "no_changes"
             report["fallback_reason"] = None
             report["finished_at"] = _utc_now()
+            print(
+                "[llm] generation decision applied: accepted=%d rejected=%d attempts=%d"
+                % (accepted, rejected, generation_attempt),
+                flush=True,
+            )
             return mutated, report
 
         # The loop always either returns or raises, but keep a defensive guard
@@ -851,8 +971,24 @@ def _parse_action_plan(
                     sbox_index = raw.get("sbox_index")
                     if not _is_int(sbox_index) or not 0 <= int(sbox_index) < 16:
                         raise MutationSchemaError("sbox_index must be in 0..15")
-                    if not _sbox_functions.is_bit_permutation_matrix(matrix):
-                        raise MutationSchemaError("S-box transformation_matrix must be a 4x4 permutation matrix")
+                    bit_permutation = raw.get("bit_permutation")
+                    if matrix is not None:
+                        raise MutationSchemaError(
+                            "S-box transformation_matrix is no longer supported; use bit_permutation"
+                        )
+                    if (
+                        not isinstance(bit_permutation, list)
+                        or len(bit_permutation) != 4
+                        or any(not _is_int(value) for value in bit_permutation)
+                        or sorted(int(value) for value in bit_permutation) != [0, 1, 2, 3]
+                        or [int(value) for value in bit_permutation] == [0, 1, 2, 3]
+                    ):
+                        raise MutationSchemaError(
+                            "S-box bit_permutation must be a non-identity permutation such as [1,0,2,3]"
+                        )
+                    normalized_permutation = [int(value) for value in bit_permutation]
+                    matrix = np.eye(4, dtype=int)[:, normalized_permutation]
+                    result["bit_permutation"] = normalized_permutation
                     result["sbox_index"] = int(sbox_index)
                     result["transformation_matrix"] = to_builtin(matrix)
                 else:
@@ -982,6 +1118,8 @@ def apply_action_plan(
             "action_type": action.get("action_type"),
             "target_candidate_id": action.get("target_candidate_id"),
             "candidate_index": target_index,
+            "action_spec": _action_spec(action),
+            "action_signature": _action_signature(action),
         }
         try:
             if target_index is None:
@@ -1048,6 +1186,35 @@ def apply_action_plan(
             )
         records.append(record)
     return mutated, records
+
+
+def _action_spec(action: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the structural part of an action, excluding generation-local IDs."""
+    keys = (
+        "action_type", "parent_candidate_ids", "round_index", "component",
+        "sbox_index", "row_swap", "column_swap", "start_component",
+    )
+    result = {key: to_builtin(action[key]) for key in keys if action.get(key) is not None}
+    if str(action.get("component", "")).startswith("sbox_"):
+        bit_permutation = action.get("bit_permutation")
+        if bit_permutation is None:
+            bit_permutation = _bit_permutation_from_matrix(action.get("transformation_matrix"))
+        if bit_permutation is not None:
+            result["bit_permutation"] = to_builtin(bit_permutation)
+    elif action.get("transformation_matrix") is not None:
+        result["transformation_matrix"] = to_builtin(action["transformation_matrix"])
+    return result
+
+
+def _bit_permutation_from_matrix(matrix: Any) -> Optional[list[int]]:
+    if not _sbox_functions.is_bit_permutation_matrix(matrix):
+        return None
+    values = np.asarray(matrix, dtype=int)
+    return [int(np.argmax(values[:, column])) for column in range(4)]
+
+
+def _action_signature(action: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(_action_spec(action)).encode("utf-8")).hexdigest()
 
 
 def _structure_issues(candidate: Any, candidate_index: int) -> list[dict[str, Any]]:
@@ -1412,8 +1579,9 @@ def _system_prompt(settings: DeepSeekSettings) -> str:
         "Return exactly one JSON object and no markdown. "
         f"The only output schema is {{\"schema_version\":\"{MUTATION_SCHEMA_VERSION}\","
         "\"request_id\":<copy input request_id>,\"generation\":<copy input generation exactly>,\"actions\":[...]}. "
-        "Return only compact actions; never output complete S-boxes or matrices. "
-        "For S-box mutation use sbox_B or sbox_D with sbox_index and a legal 4x4 permutation matrix. "
+        "Return only compact actions; never output complete S-box tables or a 64x64 matrix unless required. "
+        "For S-box mutation use sbox_B or sbox_D with sbox_index and bit_permutation. "
+        "bit_permutation must be copied from action_requirements.allowed_sbox_bit_permutations. "
         "For linear mutation prefer exactly one row_swap or column_swap pair with indices 0..63; "
         "a full 64x64 transformation_matrix is allowed only when necessary. "
         "For a crossover, output exactly two distinct parent_candidate_ids and start_component containing "
@@ -1423,18 +1591,22 @@ def _system_prompt(settings: DeepSeekSettings) -> str:
         "valid mutation or crossover targeting every listed candidate; with only one candidate, use a mutation. "
         "When exactly_one_action_per_candidate is true, output exactly one action for each listed candidate ID, "
         "with no missing IDs and no duplicate target IDs. Copy target_candidate_id and base_fingerprint exactly "
-        "from required_action_specs. Use round_index 0 and sbox_index 0 unless the candidate has no such field. "
-        "Use this exact mutation shape, replacing every placeholder with values copied from the user payload: "
+        "from required_action_specs. Choose the round, S-box index, component, and transformation deliberately "
+        "from their allowed values. Do not repeatedly choose round 0, S-box 0, or the same component. "
+        "For an S-box mutation use this exact field layout: "
         '{"schema_version":"1.0","request_id":"<request_id>","generation":<generation>,"actions":['
         '{"action_type":"mutation","target_candidate_id":"<listed_candidate_id>",'
         '"base_fingerprint":"<exact_candidate_fingerprint>","round_index":0,'
-        '"component":"sbox_B","sbox_index":0,"transformation_matrix":'
-        '[[0,1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]]}]}. '
-        "This 4x4 swap matrix is a legal S-box mutation for any round. For crossover, use the exact shape "
+        '"component":"sbox_B","sbox_index":0,"bit_permutation":[1,0,2,3]}]}. '
+        "Use concrete JSON numbers, never angle-bracket text. You may choose other allowed round/component/index/"
+        "bit_permutation values to avoid recent actions. For a linear mutation use component linear and exactly "
+        "one compact row_swap or column_swap, for example row_swap:[0,1]. For crossover, use the shape "
         '{"action_type":"crossover","target_candidate_id":"<listed_candidate_id>",'
         '"base_fingerprint":"<exact_target_fingerprint>","parent_candidate_ids":'
         '["<parent_a_id>","<parent_b_id>"],"start_component":'
         '{"round_index":0,"component":"sbox","sbox_index":0}}. '
+        "Treat every recent_action_specs entry as forbidden for that candidate. The resulting cipher must not "
+        "match any forbidden_result_fingerprints entry; vary the action enough to produce a new structure. "
         "Do not output placeholder text, markdown, extra root fields, rationale, or an empty actions array. "
         "If validation_feedback is present, repair every listed issue in the next JSON object and do not repeat "
         "the rejected action. "

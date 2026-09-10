@@ -49,8 +49,10 @@ python -m pip install -r requirements.txt
 python main.py
 ~~~
 
-Results and configuration snapshots are created below runs/. To reproduce the
-initial population and crossover randomness, set UKNIT_SEED before starting:
+Results and configuration snapshots are created below runs/. By default each
+process chooses a fresh seed, so separate runs start from different initial
+populations. To reproduce a run, read its `seed.txt` and set UKNIT_SEED before
+starting:
 
 ~~~powershell
 $env:UKNIT_SEED = "20260831"
@@ -108,6 +110,18 @@ attempts per round. If all three attempts remain invalid, the run stops with a
 component-validation error instead of accepting an invalid candidate. Failed
 API calls remain structured no-op reports.
 
+Each candidate also carries a bounded history of accepted structural actions
+and fingerprints. Repeating a recent action or recreating a previously visited
+cipher is rejected and sent back to the LLM for a different decision. Summary
+files contain only the current evaluated generation; a previous elite cannot
+replace a current member merely because their fitness values are equal.
+
+S-box decisions use the compact `bit_permutation` field, such as
+`[1,0,2,3]`; the framework expands it to the 4x4 matrix locally. Schema
+rejection reasons are printed while the run is active. If all attempts fail,
+the complete actions and validation feedback are saved as
+`llm_failure_r*_g*.json` in the current run directory.
+
 ## Team B/C plugin handoff
 
 The fixed handoff point is team_plugins/README.md. Team B replaces
@@ -122,11 +136,18 @@ default files is the simplest handoff path.
 
 ## OpenLane latency measurement
 
-Team C performance is now mandatory in plugin mode.  Each candidate is
-materialized as Verilog and evaluated independently by OpenLane; the measured
-critical-path delay is written to `latency` in nanoseconds.  If OpenLane cannot
-be started, exits unsuccessfully, or produces no timing result, the run stops
-with an error.  No placeholder latency is accepted.
+Team C performance analysis is enabled by default in plugin mode. When
+enabled, each candidate is materialized as Verilog and evaluated independently
+by OpenLane; the measured critical-path delay is written to `latency` in
+nanoseconds. If OpenLane cannot be started, exits unsuccessfully, or produces
+no timing result, the run stops with an error. No placeholder latency is used
+in this mode.
+
+Set `OPENLANE['ENABLED']` to `False`, or set
+`UKNIT_OPENLANE_ENABLED=false`, to skip OpenLane for fast search/smoke runs.
+In that mode each candidate receives `latency=1.0` with units marked as
+`placeholder`; security and structural validation still run normally, and no
+OpenLane process, Docker container, or work directory is created.
 
 On Windows, the supported setup is Docker Desktop with WSL2 integration and
 OpenLane 2 installed in WSL.  The evaluator first tries a native `openlane`,

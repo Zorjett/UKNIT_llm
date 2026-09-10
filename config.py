@@ -44,6 +44,10 @@ CIPHER_STRUCTURE = {
 # Team C performance measurement.  OpenLane is mandatory in plugin mode;
 # leave COMMAND empty to auto-detect ``openlane`` or ``wsl openlane``.
 OPENLANE = {
+    # Set to false to skip OpenLane and use the explicit latency placeholder
+    # (1.0 ns) for fast LLM/search smoke runs.
+    'ENABLED': os.getenv('UKNIT_OPENLANE_ENABLED', 'true').strip().lower()
+        in {'1', 'true', 'yes', 'on'},
     'COMMAND': os.getenv('UKNIT_OPENLANE_COMMAND', '').strip(),
     'WORK_ROOT': os.getenv('UKNIT_OPENLANE_WORK_ROOT', '').strip(),
     'TIMEOUT_SECONDS': int(os.getenv('UKNIT_OPENLANE_TIMEOUT_SECONDS', '3600')),
