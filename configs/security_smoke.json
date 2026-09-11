@@ -1,0 +1,29 @@
+{
+  "schema_version": "security-config-v0.2",
+  "analysis_profile": "project_candidate_4r",
+  "candidate_path": "../data/fixtures/candidate_valid.json",
+  "modes": [
+    "differential",
+    "linear"
+  ],
+  "start_round": 0,
+  "num_rounds": 4,
+  "endpoint_constraints": {
+    "input": "nonzero_free",
+    "output": "free"
+  },
+  "final_linear_policy": "follow_candidate_spec",
+  "solver": {
+    "name": "kissat",
+    "executable": "/home/volcano/tools/kissat/build/kissat",
+    "single_query_timeout_s": 20,
+    "total_timeout_s_per_mode": 60,
+    "max_memory_mb": null
+  },
+  "optimization": {
+    "require_witness_validation": true,
+    "require_optimality_proof": true,
+    "maximum_weight": 192
+  }
+}
+

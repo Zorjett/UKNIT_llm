@@ -1,43 +1,27 @@
-"""Team B security evaluator placeholder.
+"""Drop-in Team B entry point for the Team A repository.
 
-Replace this file with the Team B implementation while preserving
-``PLUGIN_API_VERSION = "1.0"`` and
-``evaluate_security(candidate, context)``. Both arguments and the returned
-value must be JSON-compatible dictionaries; see ``team_plugins/README.md``.
+The project is intentionally runnable directly from a checkout (``python
+main.py``), so the vendored ``src`` package is added to ``sys.path`` here
+instead of requiring an editable install just to import the plugin.
 """
 
-from __future__ import annotations
+from pathlib import Path
+import sys
 
-from typing import Any
 
-from .plugin_contracts import (
+_PROJECT_ROOT = Path(__file__).absolute().parent.parent
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from llm_cipher.security.team_a_adapter import (
     PLUGIN_API_VERSION,
-    candidate_to_dict,
-    unavailable_result,
+    PLUGIN_NAME,
+    evaluate_security,
 )
-
-
-PLUGIN_NAME = "team-b-security-placeholder"
-
-
-def evaluate_security(candidate: Any, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return an unavailable result until Team B supplies analysis.
-
-    The placeholder deliberately emits no security measurement. The framework
-    consequently assigns neutral fitness and continues the search/logging flow.
-    """
-
-    del context
-    payload = candidate_to_dict(candidate)
-    return unavailable_result(
-        "security",
-        payload["candidate_id"],
-        "Team B security evaluator has not been installed; neutral weights are in use.",
-        PLUGIN_NAME,
-    )
 
 
 evaluate = evaluate_security
 
 
-__all__ = ["PLUGIN_NAME", "PLUGIN_API_VERSION", "evaluate_security", "evaluate"]
+__all__ = ["PLUGIN_API_VERSION", "PLUGIN_NAME", "evaluate_security", "evaluate"]

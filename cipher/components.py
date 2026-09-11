@@ -95,46 +95,6 @@ class linear_layer:
     def randomize(self):
         self.matrix = linear_functions.get_linear()
 
-    def smart_randomize(self,diff_trail=None,linear_trail=None,front=False):
-        if diff_trail == None and linear_trail == None: # move to the default if diff_trail and linear_trail are not given
-            self.randomize()
-            return
-        
-        # intialize a random one so we can compare it "do-while loop"
-        self.randomize()
-        if front:
-            diff_vector = (linear_functions.inverse(self.matrix)).dot(diff_trail[0]) % 2
-            linear_vector = (linear_functions.inverse(self.matrix.T)).dot(linear_trail[0]) % 2
-        else:
-            diff_vector = self.matrix.dot(diff_trail[-1]) % 2
-            linear_vector = (self.matrix.T).dot(linear_trail[-1]) % 2
-
-        diff_no_active_sbox = sum([1 if sbox_functions.bin2int(diff_vector[4*i:4*i+4]) > 0 else 0 for i in range(16)])
-        linear_no_active_sbox = sum([1 if sbox_functions.bin2int(linear_vector[4*i:4*i+4]) > 0 else 0 for i in range(16)])
-        best_count = min(diff_no_active_sbox,linear_no_active_sbox)
-        best_matrices = [self.matrix]
-        
-        for _ in range(config.BRUTEFORCE['LINEAR_ATTEMPTS_PER_CIPHER']):
-            self.randomize()
-            if front:
-                diff_vector = (linear_functions.inverse(self.matrix)).dot(diff_trail[0]) % 2
-                linear_vector = (linear_functions.inverse(self.matrix.T)).dot(linear_trail[0]) % 2
-            else:
-                diff_vector = self.matrix.dot(diff_trail[-1]) % 2
-                linear_vector = (self.matrix.T).dot(linear_trail[-1]) % 2
-                
-            diff_no_active_sbox = sum([1 if sbox_functions.bin2int(diff_vector[4*i:4*i+4]) > 0 else 0 for i in range(16)])
-            linear_no_active_sbox = sum([1 if sbox_functions.bin2int(linear_vector[4*i:4*i+4]) > 0 else 0 for i in range(16)])
-        
-            count = min(diff_no_active_sbox,linear_no_active_sbox)
-            if count > best_count: 
-                best_matrices = [self.matrix]
-                best_count = count
-            elif count == best_count:
-                best_matrices.append(self.matrix)
-        idx = np.random.choice(len(best_matrices))
-        self.matrix = best_matrices[idx].copy()
-
     def is_equal(self,linear):
         return np.array_equal(self.matrix,linear.matrix)
 
@@ -207,64 +167,6 @@ class round_function:
     def randomize(self):
         self.substitution.randomize()
         self.linear.randomize()
-
-    def steal_one_round(self,generation,cipher):
-        # get the one with the best security latency ratio
-        try:
-            if cipher.num_rounds % 2 == 0: # add to the front
-                diff_trail = cipher.diff_trails[0].before[0]
-                linear_trail = cipher.linear_trails[0].before[0]
-            else:
-                diff_trail = cipher.diff_trails[-1].after[-1]
-                linear_trail = cipher.linear_trails[-1].after[-1]
-            best_count = 0
-            best_matrices = []
-            best_indices = []
-            for member in generation:
-                for rd_num,rd in enumerate(member.round_functions):
-                    if rd.linear == None: continue
-                    else:
-                        matrix = rd.linear.matrix
-                    if cipher.num_rounds % 2 == 0: # taking from the front
-                        diff_vector = linear_functions.inverse(matrix).dot(diff_trail) % 2
-                        linear_vector = linear_functions.inverse(matrix.T).dot(linear_trail) % 2
-                    else:
-                        diff_vector = matrix.dot(diff_trail) % 2
-                        linear_vector = (matrix.T).dot(linear_trail) % 2
-                    diff_no_active_sbox = sum([1 if sbox_functions.bin2int(diff_vector[4*i:4*i+4]) > 0 else 0 for i in range(16)])
-                    linear_no_active_sbox = sum([1 if sbox_functions.bin2int(linear_vector[4*i:4*i+4]) > 0 else 0 for i in range(16)])
-                    count = min(diff_no_active_sbox,linear_no_active_sbox)
-                    
-                    if count > best_count: 
-                        best_count = count
-                        if cipher.num_rounds % 2 == 0: # taking from the front
-                            best_indices = [(member.pop_index,rd_num)]
-                            best_substitutions = [copy.deepcopy(member.round_functions[rd_num].substitution)]
-                        else:
-                            best_indices = [(member.pop_index,rd_num+1)]
-                            best_substitutions = [copy.deepcopy(member.round_functions[rd_num+1].substitution)]
-                        best_matrices = [matrix]
-                    elif count == best_count:
-                        if cipher.num_rounds % 2 == 0: # taking from the back
-                            best_indices.append((member.pop_index,rd_num))
-                            best_substitutions.append(copy.deepcopy(member.round_functions[rd_num].substitution))
-                        else:
-                            best_indices.append((member.pop_index,rd_num+1))
-                            best_substitutions.append(copy.deepcopy(member.round_functions[rd_num+1].substitution))
-                        best_matrices.append(matrix)
-            choice = np.random.choice([i for i in range(len(best_matrices))])
-            self.linear.matrix = best_matrices[choice]
-            self.substitution = best_substitutions[choice]
-        except Exception as e:
-            print(e)
-            assert False
-            print('randomized')
-            self.randomize()
-            return None
-
-    def smart_randomize(self,diff_trail=None,linear_trail=None,front=False):
-        self.substitution.randomize()
-        self.linear.smart_randomize(diff_trail=diff_trail,linear_trail=linear_trail,front=front)
 
     def add_substitution_layer(self,substitution):
         self.substitution = substitution

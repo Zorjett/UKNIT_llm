@@ -1,0 +1,50 @@
+{
+  "schema_version": "security-config-v0.2",
+  "analysis_profile": "paper_baseline",
+  "source_cipher": "uknit-bc-12r",
+  "modes": [
+    "differential",
+    "linear"
+  ],
+  "start_round": 0,
+  "num_rounds": 4,
+  "window_semantics": "paper_W(i,r)",
+  "endpoint_constraints": {
+    "input": "nonzero_free",
+    "output": "free"
+  },
+  "paper_reference": {
+    "scope": "W(0,r)_only",
+    "not_transferable_to_other_start_rounds": true,
+    "weights_by_num_rounds": {
+      "1": {
+        "differential": 2,
+        "linear": 1
+      },
+      "2": {
+        "differential": 8,
+        "linear": 4
+      },
+      "3": {
+        "differential": 14,
+        "linear": 7
+      },
+      "4": {
+        "differential": 25,
+        "linear": 13
+      }
+    }
+  },
+  "solver": {
+    "name": "kissat",
+    "executable": "/home/volcano/tools/kissat/build/kissat",
+    "single_query_timeout_s": 20,
+    "total_timeout_s_per_mode": 60,
+    "max_memory_mb": null
+  },
+  "optimization": {
+    "require_witness_validation": true,
+    "require_optimality_proof": true,
+    "maximum_weight": 192
+  }
+}

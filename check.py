@@ -6,10 +6,10 @@ from team_plugins.plugin_contracts import candidate_to_dict
 
 
 run_dir = Path(
-    r"D:\xinxijishujingsai\UKNIT_llm_v2\UKNIT_llm-main\runs\RUN_2026-09-10_16-48-57-722536"
+    r"D:\xinxijishujingsai\UKNIT_llm_v2\UKNIT_llm-main\runs\RUN_2026-09-11_11-13-17-522396"
 )
 
-generation = pickle_load(str(run_dir / "gen_2_1.pkl"))
+generation = pickle_load(str(run_dir / "gen_3_0.pkl"))
 
 
 def format_json(obj, level=0):

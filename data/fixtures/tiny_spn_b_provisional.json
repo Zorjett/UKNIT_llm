@@ -1,0 +1,32 @@
+{
+  "schema_version": "tiny-spn-test-v0.1",
+  "fixture_id": "b-provisional-awaiting-team-c-confirmation",
+  "provenance": {
+    "status": "b_local_provisional",
+    "team_c_confirmed": false,
+    "note": "MANTIS S-box comes from the shared design space; the 8-bit layer is a B test-only addition."
+  },
+  "block_size": 8,
+  "num_rounds": 2,
+  "state_encoding": "msb0",
+  "endpoint_constraints": {
+    "input": "nonzero_free",
+    "output": "free"
+  },
+  "rounds": [
+    {
+      "sboxes": [
+        [12, 10, 13, 3, 14, 11, 15, 7, 8, 9, 1, 5, 0, 2, 4, 6],
+        [12, 10, 13, 3, 14, 11, 15, 7, 8, 9, 1, 5, 0, 2, 4, 6]
+      ],
+      "linear_rows": [[0], [4], [1], [5], [2], [6], [3], [7]]
+    },
+    {
+      "sboxes": [
+        [12, 10, 13, 3, 14, 11, 15, 7, 8, 9, 1, 5, 0, 2, 4, 6],
+        [12, 10, 13, 3, 14, 11, 15, 7, 8, 9, 1, 5, 0, 2, 4, 6]
+      ],
+      "linear_rows": null
+    }
+  ]
+}

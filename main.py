@@ -1,9 +1,7 @@
 """Entry points for the uKNIT structural search.
 
 The orchestration layer keeps evaluation and population selection, while the
-DeepSeek planner makes both structural crossover and mutation decisions. The
-planner is created in the parent process and never attached to a Member, so
-legacy ProcessPoolExecutor evaluation remains pickle-safe.
+DeepSeek planner makes both structural crossover and mutation decisions.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cipher.Ciphers import Generation
-from config import BRUTEFORCE, FRAMEWORK, HYPERPARAMETERS, INIT_SETTINGS, SEARCH_SETTINGS
+from config import FRAMEWORK, HYPERPARAMETERS, INIT_SETTINGS, SEARCH_SETTINGS
 import config
 import utils
 from iteration_logger import IterationLogger, population_summary, record_changes
@@ -48,7 +46,6 @@ def _new_run_folder() -> Path:
 
 def _prepare_run(folder: Path) -> tuple[Path, IterationLogger]:
     folder.mkdir(parents=True, exist_ok=True)
-    utils.create_necessary_folders(str(folder))
     for filename in ("config.py", "deepseek_config.py", "seed_config.py"):
         source = PROJECT_ROOT / filename
         if source.exists():
@@ -109,7 +106,7 @@ def _generation_context(generation: Generation, run_id: str) -> dict[str, Any]:
         "run_id": run_id,
         "generation": generation.gen_index,
         "num_rounds": generation.num_rounds,
-        "evaluation_mode": FRAMEWORK.get("EVALUATION_MODE", "legacy"),
+        "evaluation_mode": FRAMEWORK.get("EVALUATION_MODE", "plugins"),
         "population": [_compact_member(member) for member in generation.members],
         "elite": [_compact_member(member) for member in generation.next_fittest_population],
         "crossover_children": [
@@ -134,8 +131,6 @@ def _build_advisor(advisor: Any = None) -> Any:
 
 
 def _engineering_validator() -> Any:
-    if FRAMEWORK.get("EVALUATION_MODE", "legacy") != "plugins":
-        return None
     from team_plugins.plugin_loader import validate_candidate
 
     return validate_candidate
@@ -191,7 +186,6 @@ def run(
         }
         generation.compute_fitness(num_threads, context=evaluation_context)
         generation.print_result()
-        utils.optimize_save()
         generation.save(str(folder))
 
         evaluated_population = population_summary(generation)
@@ -244,7 +238,7 @@ def run(
             iteration_index=iteration_index - 1,
             metadata={
                 "run_id": run_id,
-                "evaluation_mode": FRAMEWORK.get("EVALUATION_MODE", "legacy"),
+                "evaluation_mode": FRAMEWORK.get("EVALUATION_MODE", "plugins"),
                 "evaluated_generation_index": evaluated_generation_index,
                 "evaluated_num_rounds": evaluated_num_rounds,
                 "evaluated_population": evaluated_population,
@@ -256,27 +250,6 @@ def run(
         )
 
         if reached_iteration_limit or transition_result == 0:
-            break
-    return generation
-
-
-def run_bruteforce() -> Generation | None:
-    """Preserve the original brute-force expansion entry point."""
-
-    folder = _new_run_folder()
-    folder, _logger = _prepare_run(folder)
-    num_pop = int(HYPERPARAMETERS["POPULATION_SIZE"])
-    num_threads = int(HYPERPARAMETERS["NUM_OF_THREADS"])
-    generation = Generation(INIT_SETTINGS["INIT_NUM_ROUNDS"], 0)
-    generation.randomize(num_pop)
-    while True:
-        generation.bruteforce_expand_pop(BRUTEFORCE["EXPANDED_POPULATION_SIZE"])
-        generation.compute_fitness(num_threads)
-        generation.print_result()
-        generation.bruteforce_reduce_pop(num_pop)
-        utils.optimize_save()
-        generation.save(str(folder))
-        if generation.num_rounds == HYPERPARAMETERS["MAX_NUM_ROUNDS"]:
             break
     return generation
 

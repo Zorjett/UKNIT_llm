@@ -5,21 +5,15 @@ class Generation: Contains info about the current generation
 
 from cipher.linear_functions import *
 from cipher.sbox_functions import *
-import analysis.latency_computation as latency
-import analysis.security_computation as security
 import cipher.components as components
 
 import utils
 import numpy as np
 import config
 from copy import deepcopy
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor  # compatibility symbol for external callers/tests
 import json
 import warnings
-try:
-    from yosys.main import Yosys
-except ImportError:  # pyosys is optional when the plugin evaluator is used
-    Yosys = None
 from team_plugins.openlane_performance import OpenLaneLatencyError
 import os
 from pathlib import Path
@@ -116,8 +110,7 @@ class Member:
         self.pop_index = None
         self.gen_index = None
         self.identifier = None
-        # Metadata is deliberately plain Python data so Member remains pickleable
-        # when legacy fitness evaluation uses ProcessPoolExecutor.
+        # Metadata is deliberately plain Python data so Member remains pickleable.
         self.evaluation_status = None
         self.evaluation_error = None
         self.plugin_security = None
@@ -175,49 +168,6 @@ class Member:
         self.add_round_function(r)
         # self.print_member()
 
-    def steal_one_round(self,generation):
-        # member function that steal a round from someone in the generation
-        r = components.round_function()
-        r.steal_one_round(generation,self) # give the generation and what member (mainly to extract info from it)
-        if self.num_rounds % 2 == 0: # add to the front
-            self.round_functions.insert(0,r)
-            for i,rf in enumerate(self.round_functions):
-                rf.round_index = i
-                rf.substitution.round_index = i
-            self.num_rounds += 1
-        else:
-            self.round_functions[-1].linear = r.linear
-            r.linear = None
-            self.add_round_function(r)
-        
-    def smart_randomize_one_round(self):
-        r = components.round_function()
-        try:
-            if self.num_rounds % 2 == 0: # add to the front
-                diff_trail = self.diff_trails[0].before
-                linear_trail = self.linear_trails[0].before
-            else:
-                diff_trail = self.diff_trails[-1].after
-                linear_trail = self.linear_trails[-1].after
-        except:
-            diff_trail = None
-            linear_trail = None
-
-        r.smart_randomize(diff_trail=diff_trail,linear_trail=linear_trail,front=self.num_rounds % 2)
-
-        if self.num_rounds % 2 == 0: # add to the front
-            self.round_functions.insert(0,r)
-            for i,rf in enumerate(self.round_functions):
-                rf.round_index = i
-                rf.substitution.round_index = i
-            self.num_rounds += 1
-        else: # add to the back
-            self.round_functions[-1].linear = r.linear
-            r.linear = None
-            self.add_round_function(r)
-
-
-
     def add_round_function(self,round_function):
         round_function.round_index = self.num_rounds
         round_function.substitution.round_index = self.num_rounds
@@ -225,27 +175,14 @@ class Member:
         self.num_rounds += 1
 
     def compute_fitness(self, context=None):
-        """Evaluate this member using the configured plugin or legacy path."""
-        mode = getattr(config, 'FRAMEWORK', {}).get('EVALUATION_MODE', 'legacy')
-        if mode == 'plugins':
-            return self.compute_plugin_fitness(context=context)
-        return self.compute_legacy_fitness()
-
-    def compute_legacy_fitness(self):
-        if Yosys is None:
-            raise RuntimeError('pyosys is required for legacy fitness evaluation')
-        # docker_instance = openlane_containers.openlane_containers.get()
-        # self.latency = self.compute_latency(docker_instance)
-        self.latency = self.compute_latency()
-        # openlane_containers.openlane_containers.put(docker_instance)
-        window = min(self.num_rounds,config.SECURITY['MAX_WINDOW'])
-        # print(window,self.num_rounds,self.pop_index)
-        self.security_diff,self.diff_trails = self.compute_diff_security(window)
-        self.security_linear,self.linear_trails = self.compute_linear_security(window)
-        self.fitness = config.FITNESS_SETTINGS['FITNESS_FORMULA'][window](min(self.security_diff + [2*s for s in self.security_linear]),self.latency,self.num_rounds)
-        self.evaluation_status = 'ok'
-        self.evaluation_error = None
-        return
+        """Evaluate this member through the active plugin interfaces."""
+        mode = getattr(config, 'FRAMEWORK', {}).get('EVALUATION_MODE', 'plugins')
+        if mode != 'plugins':
+            raise RuntimeError(
+                'Only plugin evaluation is supported; '
+                'set FRAMEWORK["EVALUATION_MODE"] to "plugins".'
+            )
+        return self.compute_plugin_fitness(context=context)
 
     def compute_plugin_fitness(self, context=None):
         """Run the stable B/C interfaces without requiring their implementations."""
@@ -391,219 +328,6 @@ class Member:
             self.evaluation_error = '%s: %s' % (type(exc).__name__, exc)
         return self.fitness
     
-    # Generating the cnf formula given the necessary details
-    def _generate_diff_cnf(self,vars_before_subst,vars_after_subst,probability_vars,auxiliary_vars,probability,window_length,start_of_window,cnf=None):
-        statements = []
-        if cnf == None:
-            # avoid trivial case
-            s = ''
-            for var in vars_before_subst[0]:
-                s += '%s ' % (var)
-            s += '0'
-            statements.append(s)
-            # round function
-            for n_index,n in enumerate(range(start_of_window,start_of_window + window_length)):
-                sec_statements = security.differential.get_subst_layer_cnf(\
-                    self.round_functions[n].substitution,vars_before_subst[n_index],vars_after_subst[n_index],\
-                    probability_vars[n_index],self.pop_index,config.FILE_PATHS['MAIN_FILE'])
-                statements.extend(sec_statements)
-                if n == (start_of_window + window_length - 1): continue # we ignore the last linear layer
-                lin_statements = security.differential.get_linear_layer_cnf(\
-                    self.round_functions[n].linear,vars_after_subst[n_index],vars_before_subst[n_index+1])
-                statements.extend(lin_statements)
-            cnf = deepcopy(statements) # to save some computation time
-        else:
-            statements = deepcopy(cnf)
-        # forming the probabilities
-        prob_statements = security.common.sequential_encoding(probability_vars,auxiliary_vars,probability)
-        statements.extend(prob_statements)
-        return statements,cnf
-    
-    # Computing a single instance of SAT
-    def _compute_diff_cnf_using_sat(self,probability,window_length,start_of_window,cnf=None):
-        input_sat_file = os.path.join(config.FILE_PATHS['SAT_DIFF_FOLDER'], 'sec_%s_input.cnf' % self.pop_index)
-        output_sat_file = os.path.join(config.FILE_PATHS['SAT_DIFF_FOLDER'], 'sec_%s_output.cnf' % self.pop_index)
-        vars_before_subst,vars_after_subst,auxiliary_vars,probability_vars,variable_count = security.common.generate_cnf_vars(probability,window_length)
-        statements,cnf = self._generate_diff_cnf(vars_before_subst,vars_after_subst,probability_vars,auxiliary_vars,probability,window_length,start_of_window,cnf=cnf)
-        statements.insert(0,'p cnf %s %s' % (variable_count-1,len(statements)))
-
-        utils.write_to_file(input_sat_file,statements)
-        sat_bool = security.common.run_sat_solver(input_sat_file,output_sat_file)
-        if sat_bool == 'sat':
-            self.diff_trails[start_of_window].reset()
-            self.diff_trails[start_of_window].start = start_of_window
-            self.diff_trails[start_of_window].read_trails_from_cnf(output_sat_file,vars_before_subst,vars_after_subst,probability_vars)
-        return sat_bool,cnf
-
-    # Given a window, computing the best differential characteristic
-    def _compute_single_diff_security(self,init_probability,window_length,start_of_window=0):
-        probability_bounds = [0,init_probability]
-        # compute the upper bound
-        cnf = None
-        while True:
-            sat_bool, cnf = self._compute_diff_cnf_using_sat(probability_bounds[1],window_length,start_of_window,cnf)
-            if sat_bool == 'sat': 
-                # print('upper bound is %s' % (probability_bounds))
-                break # we found the upper bound
-            elif sat_bool == 'unsat':
-                probability_bounds[0] = probability_bounds[1]
-                probability_bounds[1] = min(config.SECURITY['MAX_DIFF_SECURITY'], probability_bounds[1] + 2) # increment of 2 each time
-            if probability_bounds[0] == probability_bounds[1] == config.SECURITY['MAX_DIFF_SECURITY']: # exceeded what we limited
-                return config.SECURITY['MAX_DIFF_SECURITY']
-        # compute the lower bound
-        while True:
-            if probability_bounds[0] >= probability_bounds[1] - 1: # terminating criteria
-                return probability_bounds[1]
-            else:
-                probability = max(probability_bounds[0]+1,probability_bounds[1]-1)
-                sat_bool, cnf = self._compute_diff_cnf_using_sat(probability,window_length,start_of_window,cnf)
-                if sat_bool == 'sat': probability_bounds[1] = probability
-                else: probability_bounds[0] = probability
-                # print('lower bound is %s' % (probability_bounds))
-
-    # Compute a list of best differential characteristics (windows)
-    def compute_diff_security(self,window_length,start=0,end=999):
-        if window_length >= self.num_rounds:
-            self.diff_trails = [components.trail()]
-            self.security_diff = [self._compute_single_diff_security(config.SECURITY['INIT_DIFF_SECURITY'][window_length],window_length,0)]
-        else: 
-            self.security_diff = []
-            self.diff_trails = [components.trail() for _ in range(start,min(end,self.num_rounds+1-window_length))]
-            for start_of_window in range(start,min(end,self.num_rounds+1-window_length)):
-                self.security_diff.append(self._compute_single_diff_security(config.SECURITY['INIT_DIFF_SECURITY'][window_length],window_length,start_of_window))
-        return self.security_diff,self.diff_trails
-    
-    # Generating the cnf formula given the necessary details
-    def _generate_linear_cnf(self,vars_before_subst,vars_after_subst,correlation_vars,auxiliary_vars,correlation,start_of_window,window_length,cnf=None):
-        statements = []
-        if cnf == None:
-            # avoid trivial case
-            s = ''
-            for var in vars_before_subst[0]:
-                s += '%s ' % (var)
-            s += '0'
-            statements.append(s)
-            # round function
-            for n_index,n in enumerate(range(start_of_window,start_of_window + window_length)):
-                sec_statements = security.linear.get_subst_layer_cnf(\
-                    self.round_functions[n].substitution,vars_before_subst[n_index],vars_after_subst[n_index],\
-                    correlation_vars[n_index],self.pop_index,config.FILE_PATHS['MAIN_FILE'])
-                statements.extend(sec_statements)
-                if n == (start_of_window + window_length - 1): continue # we ignore the last linear layer
-                lin_statements = security.linear.get_linear_layer_cnf(\
-                    self.round_functions[n].linear,vars_after_subst[n_index],vars_before_subst[n_index+1])
-                statements.extend(lin_statements)
-            cnf = deepcopy(statements) # to save some computation time
-        else:
-            statements = deepcopy(cnf)
-        # forming the probabilities
-        prob_statements = security.common.sequential_encoding(correlation_vars,auxiliary_vars,correlation)
-        statements.extend(prob_statements)
-        return statements,cnf
-
-    # Computing a single instance of SAT
-    def _compute_linear_cnf_using_sat(self,correlation,start_of_window,window_length,cnf=None):
-        input_sat_file = os.path.join(config.FILE_PATHS['SAT_LINEAR_FOLDER'], 'sec_%s_input.cnf' % self.pop_index)
-        output_sat_file = os.path.join(config.FILE_PATHS['SAT_LINEAR_FOLDER'], 'sec_%s_output.cnf' % self.pop_index)
-        vars_before_subst,vars_after_subst,auxiliary_vars,correlation_vars,variable_count = security.common.generate_cnf_vars(correlation,window_length)
-
-        statements,cnf = self._generate_linear_cnf(vars_before_subst,vars_after_subst,correlation_vars,auxiliary_vars,correlation,start_of_window,window_length,cnf=cnf)
-        statements.insert(0,'p cnf %s %s' % (variable_count-1,len(statements)))
-
-        utils.write_to_file(input_sat_file,statements)
-        sat_bool = security.common.run_sat_solver(input_sat_file,output_sat_file)
-        if sat_bool == 'sat':
-            self.linear_trails[start_of_window].reset()
-            self.linear_trails[start_of_window].start = start_of_window
-            self.linear_trails[start_of_window].read_trails_from_cnf(output_sat_file,vars_before_subst,vars_after_subst,correlation_vars)
-        return sat_bool,cnf
-
-    # Given a window, computing the best linear trail
-    def _compute_single_linear_security(self,init_correlation,window_length,start_of_window=0):
-        correlation_bounds = [0,init_correlation]
-        # compute the upper bound
-        cnf = None
-        while True:
-            sat_bool, cnf = self._compute_linear_cnf_using_sat(correlation_bounds[1],start_of_window,window_length,cnf)
-            if sat_bool == 'sat': break # we found the upper bound
-            elif sat_bool == 'unsat':
-                correlation_bounds[0] = correlation_bounds[1]
-                correlation_bounds[1] = min(config.SECURITY['MAX_LINEAR_SECURITY'], correlation_bounds[1] + 2) # increment of 2 each time
-            if correlation_bounds[0] == correlation_bounds[1] == config.SECURITY['MAX_LINEAR_SECURITY']: # exceeded what we limited
-                return config.SECURITY['MAX_LINEAR_SECURITY']
-        # compute the lower bound
-        while True:
-            if correlation_bounds[0] >= correlation_bounds[1] - 1: # terminating criteria
-                return correlation_bounds[1]
-            else:
-                correlation = max(correlation_bounds[0]+1,correlation_bounds[1]-1)
-                sat_bool, cnf = self._compute_linear_cnf_using_sat(correlation,start_of_window,window_length)
-                if sat_bool == 'sat': correlation_bounds[1] = correlation
-                else: correlation_bounds[0] = correlation
-    
-    # Compute a list of best linear trails (windows)
-    def compute_linear_security(self,window_length,start=0,end=999):
-        if window_length >= self.num_rounds:
-            self.linear_trails = [components.trail()]
-            self.security_linear = [self._compute_single_linear_security(config.SECURITY['INIT_LINEAR_SECURITY'][window_length],window_length,0)]
-        else: 
-            self.linear_trails = [components.trail() for _ in range(start,min(end,self.num_rounds+1-window_length))]
-            self.security_linear = []
-            for start_of_window in range(start,min(end,self.num_rounds+1-window_length)):
-                self.security_linear.append(self._compute_single_linear_security(config.SECURITY['INIT_LINEAR_SECURITY'][window_length],window_length,start_of_window))
-        return self.security_linear,self.linear_trails
-
-    def _prepare_verilog_statements(self,verilog_file):
-        statements = []
-        statement = latency.prepare_preamble(self.num_rounds,verilog_file)
-        statements.extend(statement)
-
-        # Settling the key schedule and constants
-        for n in range(self.num_rounds+1): 
-            statement = latency.get_key_schedule_and_const(mkey_index=n % 2, rkey_index=n, constant_index=n); 
-            statements.append(statement)
-
-        # XOR the keys
-        statements.append('\tassign t[%s] = x ^ kn[%s];' % (0,0));
-        for n in range(1,self.num_rounds):
-            statement = latency.get_add_key(t_index=3*n-1, rkey_index=n)
-            statements.append(statement)
-        statements.append('\tassign t[%i] = t[%i] ^ kn[%i];' % (3*n+2,3*n+1,self.num_rounds))
-        statements.append('\tassign y = t[%i];' % (3*n+2))
-
-        # subst layers
-        for n in range(self.num_rounds):
-            statement = latency.get_subst_layer(3*n,2*n); 
-            statements.append(statement)
-
-        # linear layers
-        for n in range(1,self.num_rounds):
-            statement = latency.get_linear_layer(3*n-2,2*n-1)
-            statements.append(statement)
-
-        statements.append('\tendmodule\n')
-
-        # substLayer calling the sboxes
-        for n in range(self.num_rounds):
-            statement = latency.get_sboxes_in_subst_layer(2*n)
-            statements.append(statement)
-
-        # sboxes implementation
-        for n in range(self.num_rounds):
-            for i in range(16):
-                statement = latency.get_sboxes_implementation(self.round_functions[n].substitution.sboxes[i],2*n,i)
-                statements.append(statement)
-
-        # linear implementation
-        for n in range(self.num_rounds-1):
-            statement = latency.get_matrix_implementation(self.round_functions[n].linear.matrix,2*n+1)
-            statements.append(statement)
-
-        # key add const implementation
-        statement = latency.get_key_add_and_const_implementation()
-        statements.append(statement)
-        return statements
-
     def get_prince_full(self,nr):
         prince_sbox = [0xB,0xF,0x3,0x2,0xA,0xC,0x9,0x1,0x6,0x7,0x8,0x0,0xE,0x5,0xD,0x4]
         prince_m1 = linear_functions.get_prince_m1()
@@ -758,27 +482,6 @@ class Member:
         r.add_substitution_layer(r_subst)
         r.linear = None
         self.add_round_function(r)
-
-
-    def compute_latency(self):
-        if Yosys is None:
-            raise RuntimeError('pyosys is required for latency evaluation')
-        verilog_file = 'design_%s_%s.v' % (config.FILE_PATHS['MAIN_FILE'],self.pop_index)
-        statements = self._prepare_verilog_statements(verilog_file)
-        verilog_path = os.path.join(config.FILE_PATHS['VERILOG_FOLDER'], verilog_file)
-        utils.write_to_file(verilog_path,statements)
-        user_config = {
-        "VERILOG_FILES": [verilog_path], # verilog file
-        "DESIGN_NAME": "design_main_%s" % (self.pop_index), # the top module in the verilog files
-        "ABC_OUTPUT_FILE" : "abc_%s.log" % (self.pop_index),
-        "YOSYS_OUTPUT_FILE" : "yosys_%s.log" % (self.pop_index),
-        "SAVE_NETLIST" : "design_main_%s.nl.v" % (self.pop_index), # file containing the final netlist
-        }
-        yosys_directory = str(Path(__file__).resolve().parents[1] / 'yosys') + os.sep
-        yosys = Yosys(user_config,self.pop_index,directory=yosys_directory)
-        yosys.run_yosys()
-        return yosys.latency
-
 
 
     def is_equal(self,member):
@@ -1007,38 +710,46 @@ class Generation:
         return self.last_mutation_report
 
     def compute_fitness(self, max_threads=1, context=None):
+        """Evaluate every member through the active plugin interfaces."""
         tmp_members = []
-        evaluation_mode = getattr(config, 'FRAMEWORK', {}).get('EVALUATION_MODE', 'legacy')
-        if evaluation_mode == 'plugins':
-            total = len(self.members)
-            for index, member in enumerate(self.members, start=1):
+        total = len(self.members)
+        for index, member in enumerate(self.members, start=1):
+            print(
+                '[progress] evaluating candidate %d/%d (generation=%s, population=%s)' % (
+                    index,
+                    total,
+                    self.gen_index,
+                    getattr(member, 'pop_index', index - 1),
+                ),
+                flush=True,
+            )
+            member.compute_fitness(context=context)
+            security_result = getattr(member, 'plugin_security', None)
+            if (
+                isinstance(security_result, dict)
+                and str(security_result.get('status', '')).lower() != 'ok'
+            ):
+                details = security_result.get('errors') or security_result.get('warnings') or []
                 print(
-                    '[progress] evaluating candidate %d/%d (generation=%s, population=%s)' % (
+                    '[security] candidate %d/%d status=%s details=%s' % (
                         index,
                         total,
-                        self.gen_index,
-                        getattr(member, 'pop_index', index - 1),
+                        security_result.get('status', 'unknown'),
+                        details,
                     ),
                     flush=True,
                 )
-                member.compute_fitness(context=context)
-                print(
-                    '[progress] candidate %d/%d complete: latency=%s ns, fitness=%s' % (
-                        index,
-                        total,
-                        getattr(member, 'latency', None),
-                        getattr(member, 'fitness', None),
-                    ),
-                    flush=True,
-                )
-                tmp_members.append(member)
-        else:
-            with ProcessPoolExecutor(max_workers=max_threads) as executor:
-                futures = [executor.submit(utils.call_compute, member) for member in self.members]
-                for future in futures:
-                    tmp_members.append(future.result())
-        self.members = sorted(tmp_members,key=lambda member: member.pop_index)
-    
+            print(
+                '[progress] candidate %d/%d complete: latency=%s ns, fitness=%s' % (
+                    index,
+                    total,
+                    getattr(member, 'latency', None),
+                    getattr(member, 'fitness', None),
+                ),
+                flush=True,
+            )
+            tmp_members.append(member)
+        self.members = sorted(tmp_members, key=lambda member: member.pop_index)
     def print_result(self):
         population = self.next_fittest_population or sorted(
             self.members,
@@ -1095,50 +806,6 @@ class Generation:
         
         with open(meta_file, "w", encoding='utf-8') as f:
             json.dump(to_builtin(datas), f, indent=4, ensure_ascii=False)
-
-    @staticmethod
-    def _trail_endpoint_available(trails, endpoint):
-        """Return whether a legacy trail collection has a usable endpoint.
-
-        Team B's placeholder/plugin results intentionally leave ``diff_trails``
-        and ``linear_trails`` unset.  The original steal implementation expects
-        a populated ``trail`` object and asserts when it is absent.  Keep this
-        check deliberately narrow so legacy trail objects retain their original
-        behavior while plugin generations can select the safe random expansion.
-        """
-        if not isinstance(trails, (list, tuple)) or not trails:
-            return False
-        try:
-            trail_item = trails[0] if endpoint == 'before' else trails[-1]
-            values = getattr(trail_item, endpoint, None)
-            if values is None or len(values) == 0:
-                return False
-            vector = values[0] if endpoint == 'before' else values[-1]
-            return vector is not None and len(vector) > 0
-        except (AttributeError, IndexError, TypeError, ValueError):
-            return False
-
-    @classmethod
-    def _can_steal_one_round(cls, member, source_members=None):
-        """Check the minimum state required by ``round_function.steal_one_round``."""
-        parity = int(getattr(member, 'num_rounds', 0)) % 2
-        endpoint = 'before' if parity == 0 else 'after'
-        if not cls._trail_endpoint_available(getattr(member, 'diff_trails', None), endpoint):
-            return False
-        if not cls._trail_endpoint_available(getattr(member, 'linear_trails', None), endpoint):
-            return False
-
-        # The steal implementation also needs at least one source round with a
-        # linear matrix.  This is normally guaranteed by randomized candidates,
-        # but checking it avoids an empty ``np.random.choice`` in plugin runs.
-        if source_members is not None:
-            for source in source_members:
-                for round_function in getattr(source, 'round_functions', []) or []:
-                    linear = getattr(round_function, 'linear', None)
-                    if linear is not None and getattr(linear, 'matrix', None) is not None:
-                        return True
-            return False
-        return True
 
     def next_gen(self,max_threads=1):
         print('moving on to the next generation')
@@ -1248,20 +915,3 @@ class Generation:
 
         print('next num rounds: %s, gen_index: %s' % (self.num_rounds,self.gen_index))
         return 1
-
-    def bruteforce_expand_pop(self,num_expanded_pop):
-        # adding one round 
-        self.next_members = []
-
-        for i in range(num_expanded_pop):
-            member = deepcopy(self.members[i % self.num_member])
-            member.smart_randomize_one_round()
-            member.pop_index = i
-            self.next_members.append(member)
-        self.members = self.next_members
-        self.num_member = num_expanded_pop
-        self.next_members = []
-
-    def bruteforce_reduce_pop(self,num_pop):
-        self.members = sorted(self.members,key=lambda x: x.fitness, reverse=True)[:num_pop]
-        self.num_member = num_pop

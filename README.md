@@ -22,18 +22,21 @@ saving, and round-growth flow are kept for compatibility.
 
 ## Framework status
 
-The checked-in repository is intentionally runnable before Teams B and C
-deliver their implementations:
+The checked-in repository is runnable with the Team B security adapter and the
+Team C/OpenLane adapter:
 
 - config.py defaults to EVALUATION_MODE=plugins.
-- The Team B and Team C files in team_plugins/ are contract-valid placeholders.
-  They do not invent security or performance measurements.
-- deepseek_config.py intentionally contains an empty API key and an empty
-  model. With either value empty, the LLM planner makes no HTTP request and
-  preserves the crossover children unchanged.
-- In either unavailable case, evaluation uses neutral fitness (0.0) and the
-  LLM-guided search loop continues. These runs are smoke/integration runs, not cipher
-  security or latency results.
+- Team B performs strict 3--12-round single-trail differential and linear
+  analysis through Kissat. Unsupported round counts return an explicit
+  `unavailable` result before SAT starts; they are not assigned a fake score.
+- Team C performs structural validation and OpenLane timing when enabled. The
+  performance switch is independent of Team B security analysis.
+- deepseek_config.py intentionally contains an empty API key and model in the
+  checked-in checkout. With either value empty, the LLM planner makes no HTTP
+  request and preserves the crossover children unchanged.
+- A run with no LLM credentials, a disabled evaluator, or an unsupported
+  security round count is a smoke/integration run, not a scientific security
+  or latency result.
 
 The iteration audit log is written to
 runs/RUN_*/logs/iteration_log.jsonl. It records population summaries,
@@ -65,6 +68,10 @@ are not configured because those decisions belong to the LLM planner. Use
 UKNIT_EVALUATION_MODE=legacy only when the original SAT/Yosys toolchain is
 installed; legacy evaluation still needs Kissat, Espresso, and its original
 runtime dependencies.
+
+The Team B security implementation, threat-model boundary, solver contract,
+and reproducible WSL/Windows setup are documented in
+[`docs/security_analysis_and_environment.md`](docs/security_analysis_and_environment.md).
 
 ## uKNIT baseline file
 
@@ -124,11 +131,11 @@ the complete actions and validation feedback are saved as
 
 ## Team B/C plugin handoff
 
-The fixed handoff point is team_plugins/README.md. Team B replaces
-team_plugins/security_evaluator.py; Team C replaces
-team_plugins/engineering_evaluator.py. Keep the documented public function
-names and PLUGIN_API_VERSION = "1.0". No main-framework change is needed after
-replacement.
+The fixed handoff point is team_plugins/README.md. The integrated Team B
+implementation is `team_plugins/security_evaluator.py`; Team C remains in
+`team_plugins/engineering_evaluator.py`. Keep the documented public function
+names and `PLUGIN_API_VERSION = "1.0"`. No main-framework call-site change is
+needed.
 
 The loader can alternatively import packaged implementations through
 UKNIT_SECURITY_PLUGIN and UKNIT_ENGINEERING_PLUGIN, but replacing the two
@@ -182,8 +189,8 @@ packages such as `cipher` remain importable from WSL mounted drives.
 
 ## Legacy prerequisites
 
-The default placeholder/plugin workflow does not run the original SAT/Yosys
-evaluation tools. For legacy mode, install and expose the following tools in
+The default plugin workflow does not run the original SAT/Yosys legacy
+evaluation path. For legacy mode, install and expose the following tools in
 PATH, or configure their paths in config.py:
 
 - Kissat, or a compatible SAT solver;
